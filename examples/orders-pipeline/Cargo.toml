@@ -1,0 +1,12 @@
+[package]
+name = "orders-pipeline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "End-to-end QX example: producer + consumer group + workflow"
+publish = false
+
+[dependencies]
+qx-broker = { path = "../../crates/broker" }
+tokio.workspace = true

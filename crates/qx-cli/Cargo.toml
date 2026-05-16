@@ -1,0 +1,16 @@
+[package]
+name = "qx-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QX command-line client — send/stream/join-group/workflow create against a running qxd"
+
+[dependencies]
+qx-broker = { path = "../broker" }
+tokio.workspace = true
+clap.workspace = true
+
+[[bin]]
+name = "qx"
+path = "src/main.rs"

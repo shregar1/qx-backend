@@ -1,0 +1,16 @@
+[package]
+name = "qx-topic"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Multi-partition topic abstraction over qx-queue"
+
+[dependencies]
+qx-queue = { path = "../queue" }
+qx-storage = { path = "../storage" }
+xxhash-rust.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

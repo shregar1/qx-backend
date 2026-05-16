@@ -1,0 +1,293 @@
+syntax = "proto3";
+
+package qx.v1;
+
+service Broker {
+  rpc OpenTopic(OpenTopicRequest) returns (OpenTopicResponse);
+  rpc Send(SendRequest) returns (SendResponse);
+  rpc SendBatch(SendBatchRequest) returns (SendBatchResponse);
+  rpc Receive(ReceiveRequest) returns (ReceiveResponse);
+  rpc ReceiveStream(ReceiveStreamRequest) returns (stream TopicMessage);
+  rpc Ack(AckRequest) returns (AckResponse);
+  rpc Nack(NackRequest) returns (NackResponse);
+  rpc ExtendVisibility(ExtendVisibilityRequest) returns (ExtendVisibilityResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Consumer-group surface (committed offsets per (group, partition))
+  rpc StreamFromGroup(StreamFromGroupRequest) returns (StreamFromGroupResponse);
+  rpc CommitGroupOffset(CommitGroupOffsetRequest) returns (CommitGroupOffsetResponse);
+  rpc GetGroupOffset(GetGroupOffsetRequest) returns (GetGroupOffsetResponse);
+
+  // Group coordinator (rebalanceable members per topic/group)
+  rpc JoinGroup(JoinGroupRequest) returns (JoinGroupResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
+  rpc StreamForMember(StreamForMemberRequest) returns (StreamFromGroupResponse);
+
+  // Workflow surface (task DAG)
+  rpc CreateRootTask(CreateRootTaskRequest) returns (CreateTaskResponse);
+  rpc CreateChildTask(CreateChildTaskRequest) returns (CreateTaskResponse);
+  rpc GetTask(GetTaskRequest) returns (TaskMessage);
+  rpc ListChildren(ListChildrenRequest) returns (ListChildrenResponse);
+  rpc MarkTaskRunning(TaskOpRequest) returns (TaskOpResponse);
+  rpc CompleteTask(CompleteTaskRequest) returns (TaskOpResponse);
+  rpc FailTask(FailTaskRequest) returns (TaskOpResponse);
+  rpc CancelTask(TaskOpRequest) returns (CancelTaskResponse);
+
+  // Schema registry
+  rpc RegisterSchema(RegisterSchemaRequest) returns (SchemaMessage);
+  rpc GetSchemaById(GetSchemaByIdRequest) returns (SchemaMessage);
+  rpc GetSchemaVersion(GetSchemaVersionRequest) returns (SchemaMessage);
+  rpc GetLatestSchema(GetLatestSchemaRequest) returns (SchemaMessage);
+  rpc ListSchemaVersions(ListSchemaVersionsRequest) returns (ListSchemaVersionsResponse);
+  rpc ListSubjects(ListSubjectsRequest) returns (ListSubjectsResponse);
+}
+
+message OpenTopicRequest {
+  string name = 1;
+  uint32 partition_count = 2;
+}
+message OpenTopicResponse {
+  uint32 partition_count = 1;
+}
+
+message SendRequest {
+  string topic = 1;
+  bytes key = 2;
+  bytes payload = 3;
+}
+message SendResponse {
+  uint32 partition = 1;
+  uint64 record_id = 2;
+}
+
+message SendItem {
+  bytes key = 1;
+  bytes payload = 2;
+}
+message SendBatchRequest {
+  string topic = 1;
+  repeated SendItem items = 2;
+}
+message SendBatchResponse {
+  repeated SendResponse results = 1;
+}
+
+message Receipt {
+  uint32 partition = 1;
+  uint64 record_id = 2;
+  uint32 attempt = 3;
+}
+
+message TopicMessage {
+  uint32 partition = 1;
+  uint64 id = 2;
+  Receipt receipt = 3;
+  uint32 attempts = 4;
+  bytes payload = 5;
+}
+
+message ReceiveRequest {
+  string topic = 1;
+  uint32 max = 2;
+}
+message ReceiveResponse {
+  repeated TopicMessage messages = 1;
+}
+
+message ReceiveStreamRequest {
+  string topic = 1;
+  uint32 max_batch = 2;
+  uint64 poll_interval_ms = 3;
+}
+
+message AckRequest {
+  string topic = 1;
+  Receipt receipt = 2;
+}
+message AckResponse {}
+
+message NackRequest {
+  string topic = 1;
+  Receipt receipt = 2;
+}
+message NackResponse {}
+
+message ExtendVisibilityRequest {
+  string topic = 1;
+  Receipt receipt = 2;
+  uint64 extension_ms = 3;
+}
+message ExtendVisibilityResponse {}
+
+message StatsRequest {
+  string topic = 1;
+}
+message StatsResponse {
+  uint32 partition_count = 1;
+  uint64 pending = 2;
+  uint64 inflight = 3;
+  uint64 dead = 4;
+}
+
+// --- Consumer groups ---
+
+message StreamFromGroupRequest {
+  string topic = 1;
+  string group = 2;
+  uint32 partition = 3;
+  uint32 max = 4;
+}
+message StreamedRecord {
+  uint32 partition = 1;
+  uint64 id = 2;
+  bytes payload = 3;
+}
+message StreamFromGroupResponse {
+  repeated StreamedRecord messages = 1;
+}
+
+message CommitGroupOffsetRequest {
+  string topic = 1;
+  string group = 2;
+  uint32 partition = 3;
+  uint64 offset = 4;
+}
+message CommitGroupOffsetResponse {}
+
+message GetGroupOffsetRequest {
+  string topic = 1;
+  string group = 2;
+  uint32 partition = 3;
+}
+message GetGroupOffsetResponse {
+  optional uint64 offset = 1;
+}
+
+// --- Group coordinator ---
+
+message JoinGroupRequest {
+  string topic = 1;
+  string group = 2;
+}
+message JoinGroupResponse {
+  uint64 member_id = 1;
+  uint64 generation = 2;
+  repeated uint32 assignment = 3;
+}
+
+message HeartbeatRequest {
+  string topic = 1;
+  string group = 2;
+  uint64 member_id = 3;
+}
+message HeartbeatResponse {
+  uint64 generation = 1;
+  repeated uint32 assignment = 2;
+}
+
+message LeaveGroupRequest {
+  string topic = 1;
+  string group = 2;
+  uint64 member_id = 3;
+}
+message LeaveGroupResponse {}
+
+message StreamForMemberRequest {
+  string topic = 1;
+  string group = 2;
+  uint64 member_id = 3;
+  uint32 max = 4;
+}
+
+// --- Workflow ---
+
+message CreateRootTaskRequest {
+  string workflow = 1;
+  bytes payload = 2;
+}
+message CreateChildTaskRequest {
+  string workflow = 1;
+  uint64 parent_id = 2;
+  bytes payload = 3;
+}
+message CreateTaskResponse {
+  uint64 task_id = 1;
+}
+
+message GetTaskRequest {
+  string workflow = 1;
+  uint64 task_id = 2;
+}
+message TaskMessage {
+  uint64 id = 1;
+  optional uint64 parent_id = 2;
+  // Mirrors qx_workflow::TaskStatus: 0=Pending, 1=Running, 2=Done, 3=Failed, 4=Cancelled.
+  uint32 status = 3;
+  uint64 created_nanos = 4;
+  bytes payload = 5;
+  bytes result = 6;
+  string error = 7;
+}
+
+message ListChildrenRequest {
+  string workflow = 1;
+  uint64 parent_id = 2;
+}
+message ListChildrenResponse {
+  repeated uint64 child_ids = 1;
+}
+
+message TaskOpRequest {
+  string workflow = 1;
+  uint64 task_id = 2;
+}
+message TaskOpResponse {}
+
+message CompleteTaskRequest {
+  string workflow = 1;
+  uint64 task_id = 2;
+  bytes result = 3;
+}
+message FailTaskRequest {
+  string workflow = 1;
+  uint64 task_id = 2;
+  string error = 3;
+}
+message CancelTaskResponse {
+  uint64 cancelled = 1;
+}
+
+// --- Schema registry ---
+
+message SchemaMessage {
+  uint64 id = 1;
+  string subject = 2;
+  uint32 version = 3;
+  bytes bytes = 4;
+}
+
+message RegisterSchemaRequest {
+  string subject = 1;
+  bytes bytes = 2;
+}
+message GetSchemaByIdRequest {
+  uint64 id = 1;
+}
+message GetSchemaVersionRequest {
+  string subject = 1;
+  uint32 version = 2;
+}
+message GetLatestSchemaRequest {
+  string subject = 1;
+}
+message ListSchemaVersionsRequest {
+  string subject = 1;
+}
+message ListSchemaVersionsResponse {
+  repeated uint32 versions = 1;
+}
+message ListSubjectsRequest {}
+message ListSubjectsResponse {
+  repeated string subjects = 1;
+}

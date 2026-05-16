@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/storage",
+    "crates/queue",
+    "crates/topic",
+    "crates/broker",
+    "crates/workflow",
+    "crates/raft",
+    "crates/schema-registry",
+    "crates/mirror",
+    "crates/qxd",
+    "crates/qx-cli",
+    "examples/orders-pipeline",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+thiserror = "2"
+crc32fast = "1"
+tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+redb = "2"
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+openraft = { version = "0.9", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

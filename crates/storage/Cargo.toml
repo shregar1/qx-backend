@@ -1,0 +1,19 @@
+[package]
+name = "qx-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Durable append-only log storage for QX"
+
+[dependencies]
+thiserror.workspace = true
+crc32fast.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "storage_bench"
+harness = false

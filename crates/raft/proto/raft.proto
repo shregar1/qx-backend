@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package qx.raft.v1;
+
+// Three Raft RPCs. The body of every call is an opaque JSON-serialised
+// openraft request/response — we don't mirror openraft's generic types in
+// protobuf because they involve type parameters that don't translate cleanly.
+service Raft {
+  rpc AppendEntries(RaftBytes) returns (RaftBytes);
+  rpc Vote(RaftBytes) returns (RaftBytes);
+  rpc InstallSnapshot(RaftBytes) returns (RaftBytes);
+}
+
+message RaftBytes {
+  bytes data = 1;
+}

@@ -1,0 +1,23 @@
+[package]
+name = "qxd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QX broker daemon — runs the gRPC service and the Prometheus metrics endpoint from a TOML config"
+
+[dependencies]
+qx-broker = { path = "../broker" }
+tokio.workspace = true
+serde = { version = "1", features = ["derive"] }
+toml.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["fs", "process"] }
+tempfile.workspace = true
+rcgen = "0.13"
+
+[[bin]]
+name = "qxd"
+path = "src/main.rs"

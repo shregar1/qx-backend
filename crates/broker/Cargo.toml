@@ -1,0 +1,27 @@
+[package]
+name = "qx-broker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "gRPC broker exposing qx-topic over the network"
+
+[dependencies]
+qx-topic = { path = "../topic" }
+qx-queue = { path = "../queue" }
+qx-storage = { path = "../storage" }
+qx-workflow = { path = "../workflow" }
+qx-schema-registry = { path = "../schema-registry" }
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+rcgen = "0.13"
