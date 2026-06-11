@@ -62,7 +62,10 @@ async fn task_emits_land_in_target_topic() {
             "wf1",
             task_id,
             b"out".to_vec(),
-            &[("downstream", b"emit-A"), ("downstream", b"emit-B")],
+            &[
+                ("downstream", bytes::Bytes::from_static(b"emit-A")),
+                ("downstream", bytes::Bytes::from_static(b"emit-B")),
+            ],
         )
         .unwrap();
 
@@ -96,7 +99,12 @@ async fn delivered_emits_dont_resend_on_redrain() {
 
     let task_id = grpc.create_root_task("wf2", b"x".to_vec()).await.unwrap();
     broker
-        .complete_task_with_emits("wf2", task_id, b"done".to_vec(), &[("out", b"once")])
+        .complete_task_with_emits(
+            "wf2",
+            task_id,
+            b"done".to_vec(),
+            &[("out", bytes::Bytes::from_static(b"once"))],
+        )
         .unwrap();
 
     // Wait for delivery.

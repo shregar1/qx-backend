@@ -31,6 +31,17 @@ const NEXT_EMIT_KEY: &str = "next_emit_id";
 
 pub struct Engine {
     db: Database,
+    /// Scratch buffer reused across every redb-insert encoding step
+    /// inside one logical operation. `Task::encode_into` and
+    /// `PendingEmit::encode_into` both clear-and-extend this buffer
+    /// rather than allocating a fresh `Vec` per write. Over a fan-out
+    /// of N emits, total Vec growth is O(max(emit_size)), not
+    /// O(sum(emit_size)).
+    ///
+    /// `&mut self` is required for every public Engine method that
+    /// writes, so concurrent access is already impossible — no lock
+    /// is needed around the scratch buffer.
+    encode_buf: Vec<u8>,
 }
 
 impl Engine {
@@ -41,7 +52,10 @@ impl Engine {
         }
         let db = Database::create(path)?;
         ensure_schema(&db)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            encode_buf: Vec::new(),
+        })
     }
 
     pub fn create_root(&mut self, payload: &[u8]) -> Result<TaskId> {
@@ -50,6 +64,23 @@ impl Engine {
 
     pub fn create_child(&mut self, parent_id: TaskId, payload: &[u8]) -> Result<TaskId> {
         self.create(Some(parent_id), payload)
+    }
+
+    /// Symmetric Bytes-accepting variants of [`Self::create_root`] /
+    /// [`Self::create_child`]. The bytes go straight through to the
+    /// redb insert via `payload.as_ref()`, so a caller that already
+    /// holds a refcounted slice doesn't pay an extra `Vec<u8>`
+    /// conversion to call into the engine.
+    pub fn create_root_bytes(&mut self, payload: &bytes::Bytes) -> Result<TaskId> {
+        self.create(None, payload.as_ref())
+    }
+
+    pub fn create_child_bytes(
+        &mut self,
+        parent_id: TaskId,
+        payload: &bytes::Bytes,
+    ) -> Result<TaskId> {
+        self.create(Some(parent_id), payload.as_ref())
     }
 
     /// Create a root task only if `dedup_key` hasn't been seen before. If
@@ -94,7 +125,8 @@ impl Engine {
                         result: None,
                         error: None,
                     };
-                    tasks.insert(id, task.encode().as_slice())?;
+                    task.encode_into(&mut self.encode_buf);
+                    tasks.insert(id, self.encode_buf.as_slice())?;
                 }
                 {
                     let mut dedup = write_txn.open_table(DEDUP_TABLE)?;
@@ -146,7 +178,7 @@ impl Engine {
         &mut self,
         id: TaskId,
         result: impl Into<bytes::Bytes>,
-        emits: &[(&str, &[u8])],
+        emits: &[(&str, bytes::Bytes)],
     ) -> Result<Vec<u64>> {
         let result: bytes::Bytes = result.into();
         let write_txn = self.db.begin_write()?;
@@ -163,7 +195,8 @@ impl Engine {
             }
             task.status = TaskStatus::Done;
             task.result = Some(result.clone());
-            tasks.insert(id, task.encode().as_slice())?;
+            task.encode_into(&mut self.encode_buf);
+            tasks.insert(id, self.encode_buf.as_slice())?;
         }
         let mut emit_ids = Vec::with_capacity(emits.len());
         if !emits.is_empty() {
@@ -174,13 +207,17 @@ impl Engine {
             {
                 let mut outbox = write_txn.open_table(OUTBOX_TABLE)?;
                 for (target_topic, payload) in emits {
+                    // Cloning a `Bytes` here is a refcount bump — no
+                    // memcpy. The caller's slice survives until we
+                    // commit the redb txn (encoded inline below).
                     let emit = PendingEmit {
                         emit_id: next_emit,
                         task_id: id,
                         target_topic: target_topic.to_string(),
-                        payload: bytes::Bytes::copy_from_slice(payload),
+                        payload: payload.clone(),
                     };
-                    outbox.insert(next_emit, emit.encode().as_slice())?;
+                    emit.encode_into(&mut self.encode_buf);
+                    outbox.insert(next_emit, self.encode_buf.as_slice())?;
                     emit_ids.push(next_emit);
                     next_emit += 1;
                 }
@@ -254,7 +291,8 @@ impl Engine {
                     continue;
                 }
                 t.status = TaskStatus::Cancelled;
-                tasks.insert(*tid, t.encode().as_slice())?;
+                t.encode_into(&mut self.encode_buf);
+                tasks.insert(*tid, self.encode_buf.as_slice())?;
                 cancelled += 1;
             }
         }
@@ -300,7 +338,8 @@ impl Engine {
                 result: None,
                 error: None,
             };
-            tasks.insert(id, task.encode().as_slice())?;
+            task.encode_into(&mut self.encode_buf);
+            tasks.insert(id, self.encode_buf.as_slice())?;
             if let Some(pid) = parent_id {
                 let mut children = write_txn.open_multimap_table(CHILDREN_TABLE)?;
                 children.insert(pid, id)?;
@@ -324,7 +363,8 @@ impl Engine {
                 .to_vec();
             let mut task = Task::decode(id, &bytes)?;
             mutate(&mut task)?;
-            tasks.insert(id, task.encode().as_slice())?;
+            task.encode_into(&mut self.encode_buf);
+            tasks.insert(id, self.encode_buf.as_slice())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -355,14 +395,19 @@ pub struct PendingEmit {
 }
 
 impl PendingEmit {
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 4 + self.target_topic.len() + 4 + self.payload.len());
-        out.extend_from_slice(&self.task_id.to_le_bytes());
-        out.extend_from_slice(&(self.target_topic.len() as u32).to_le_bytes());
-        out.extend_from_slice(self.target_topic.as_bytes());
-        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.payload);
-        out
+    /// Encode into a caller-provided buffer, reusing its allocation
+    /// across emits. The engine's `complete_with_emits` keeps one
+    /// `encode_buf` and clears it between iterations so a fan-out of
+    /// N emits costs O(1) Vec growth and not N fresh allocations.
+    fn encode_into(&self, buf: &mut Vec<u8>) {
+        let needed = 8 + 4 + self.target_topic.len() + 4 + self.payload.len();
+        buf.clear();
+        buf.reserve(needed);
+        buf.extend_from_slice(&self.task_id.to_le_bytes());
+        buf.extend_from_slice(&(self.target_topic.len() as u32).to_le_bytes());
+        buf.extend_from_slice(self.target_topic.as_bytes());
+        buf.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.payload);
     }
 
     fn decode(emit_id: u64, bytes: &[u8]) -> Result<Self> {

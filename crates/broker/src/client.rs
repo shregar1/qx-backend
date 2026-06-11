@@ -418,6 +418,20 @@ impl Client {
     }
 
     pub async fn create_root_task(&mut self, workflow: &str, payload: Vec<u8>) -> Result<u64> {
+        self.create_root_task_bytes(workflow, bytes::Bytes::from(payload))
+            .await
+    }
+
+    /// `Bytes`-accepting variant of [`Self::create_root_task`]. The
+    /// payload becomes the proto envelope's `payload` field without
+    /// a `Vec<u8>` → `Bytes` round-trip — callers that already hold a
+    /// refcounted buffer (forwarding paths, outbox dispatcher, etc.)
+    /// avoid the move.
+    pub async fn create_root_task_bytes(
+        &mut self,
+        workflow: &str,
+        payload: bytes::Bytes,
+    ) -> Result<u64> {
         let resp = self
             .inner
             .create_root_task(self.auth(proto::CreateRootTaskRequest {
@@ -433,6 +447,17 @@ impl Client {
         workflow: &str,
         parent_id: u64,
         payload: Vec<u8>,
+    ) -> Result<u64> {
+        self.create_child_task_bytes(workflow, parent_id, bytes::Bytes::from(payload))
+            .await
+    }
+
+    /// `Bytes`-accepting variant of [`Self::create_child_task`].
+    pub async fn create_child_task_bytes(
+        &mut self,
+        workflow: &str,
+        parent_id: u64,
+        payload: bytes::Bytes,
     ) -> Result<u64> {
         let resp = self
             .inner
@@ -482,6 +507,17 @@ impl Client {
         workflow: &str,
         task_id: u64,
         result: Vec<u8>,
+    ) -> Result<()> {
+        self.complete_task_bytes(workflow, task_id, bytes::Bytes::from(result))
+            .await
+    }
+
+    /// `Bytes`-accepting variant of [`Self::complete_task`].
+    pub async fn complete_task_bytes(
+        &mut self,
+        workflow: &str,
+        task_id: u64,
+        result: bytes::Bytes,
     ) -> Result<()> {
         self.inner
             .complete_task(self.auth(proto::CompleteTaskRequest {

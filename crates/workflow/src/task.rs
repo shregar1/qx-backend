@@ -58,12 +58,18 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn encode(&self) -> Vec<u8> {
+    /// Encode into a caller-provided buffer, reusing its allocation.
+    /// The engine pools one `encode_buf` across every task write in a
+    /// transaction so a long completion loop doesn't allocate a
+    /// fresh `Vec` per task. The buffer is cleared first so callers
+    /// can pass a recycled scratch.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         let result_bytes: &[u8] = self.result.as_deref().unwrap_or(&[]);
         let error_bytes: &[u8] = self.error.as_deref().map(str::as_bytes).unwrap_or(b"");
-        let mut buf = Vec::with_capacity(
-            HEADER_SIZE + self.payload.len() + result_bytes.len() + error_bytes.len(),
-        );
+        let needed =
+            HEADER_SIZE + self.payload.len() + result_bytes.len() + error_bytes.len();
+        buf.clear();
+        buf.reserve(needed);
         buf.push(self.status as u8);
         buf.push(u8::from(self.parent_id.is_some()));
         buf.extend_from_slice(&self.parent_id.unwrap_or(0).to_le_bytes());
@@ -77,7 +83,15 @@ impl Task {
 
         buf.extend_from_slice(&(error_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(error_bytes);
+    }
 
+    /// Compatibility wrapper that allocates a fresh `Vec` and
+    /// delegates to [`Self::encode_into`]. Callers that aren't in a
+    /// hot loop can keep using this; the engine's transaction paths
+    /// switched to `encode_into` with a pooled buffer.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.encode_into(&mut buf);
         buf
     }
 

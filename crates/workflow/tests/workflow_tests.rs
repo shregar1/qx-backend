@@ -47,7 +47,14 @@ fn complete_with_emits_stages_outbox_entries() {
     let mut e = engine_in(&tmp);
     let id = e.create_root(b"input").unwrap();
     let ids = e
-        .complete_with_emits(id, b"done".to_vec(), &[("topic-a", b"emit-1"), ("topic-b", b"emit-2")])
+        .complete_with_emits(
+            id,
+            b"done".to_vec(),
+            &[
+                ("topic-a", bytes::Bytes::from_static(b"emit-1")),
+                ("topic-b", bytes::Bytes::from_static(b"emit-2")),
+            ],
+        )
         .unwrap();
     assert_eq!(ids.len(), 2);
 
@@ -73,7 +80,12 @@ fn complete_with_emits_is_atomic() {
     let id = {
         let mut e = engine_in(&tmp);
         let id = e.create_root(b"in").unwrap();
-        e.complete_with_emits(id, b"out".to_vec(), &[("t", b"p")]).unwrap();
+        e.complete_with_emits(
+            id,
+            b"out".to_vec(),
+            &[("t", bytes::Bytes::from_static(b"p"))],
+        )
+        .unwrap();
         id
     };
     let e = engine_in(&tmp);
