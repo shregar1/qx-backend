@@ -41,6 +41,41 @@ service Broker {
   rpc GetLatestSchema(GetLatestSchemaRequest) returns (SchemaMessage);
   rpc ListSchemaVersions(ListSchemaVersionsRequest) returns (ListSchemaVersionsResponse);
   rpc ListSubjects(ListSubjectsRequest) returns (ListSubjectsResponse);
+
+  // Triggers: durably bind (topic, workflow) so each topic record creates
+  // a workflow task. The dispatcher runs broker-side; clients only register.
+  rpc RegisterTrigger(TriggerSpec) returns (RegisterTriggerResponse);
+  rpc UnregisterTrigger(UnregisterTriggerRequest) returns (UnregisterTriggerResponse);
+  rpc ListTriggers(ListTriggersRequest) returns (ListTriggersResponse);
+
+  // Complete a workflow task and atomically stage one or more topic emits
+  // for delivery. The transactional-outbox dispatcher delivers them
+  // asynchronously.
+  rpc CompleteTaskWithEmits(CompleteTaskWithEmitsRequest) returns (TaskOpResponse);
+}
+
+message TriggerSpec {
+  string name = 1;
+  string topic = 2;
+  string workflow = 3;
+  uint32 batch_size = 4;       // 0 = use default
+  uint64 poll_interval_ms = 5; // 0 = use default
+}
+message RegisterTriggerResponse {}
+message UnregisterTriggerRequest { string name = 1; }
+message UnregisterTriggerResponse { bool removed = 1; }
+message ListTriggersRequest {}
+message ListTriggersResponse { repeated TriggerSpec triggers = 1; }
+
+message TopicEmit {
+  string topic = 1;
+  bytes payload = 2;
+}
+message CompleteTaskWithEmitsRequest {
+  string workflow = 1;
+  uint64 task_id = 2;
+  bytes result = 3;
+  repeated TopicEmit emits = 4;
 }
 
 message OpenTopicRequest {

@@ -17,7 +17,82 @@ fn create_root_returns_task_with_no_parent() {
     assert_eq!(t.id, id);
     assert!(t.parent_id.is_none());
     assert_eq!(t.status, TaskStatus::Pending);
-    assert_eq!(t.payload, b"do thing");
+    assert_eq!(&t.payload[..], b"do thing");
+}
+
+#[test]
+fn create_root_idempotent_returns_same_id_for_same_key() {
+    let tmp = tempdir().unwrap();
+    let mut e = engine_in(&tmp);
+    let id1 = e.create_root_idempotent(b"key-a", b"payload-1").unwrap();
+    let id2 = e.create_root_idempotent(b"key-a", b"payload-2").unwrap();
+    assert_eq!(id1, id2);
+    // Second call must not have overwritten the first payload.
+    let t = e.get(id1).unwrap().unwrap();
+    assert_eq!(&t.payload[..], b"payload-1");
+}
+
+#[test]
+fn create_root_idempotent_different_keys_get_different_ids() {
+    let tmp = tempdir().unwrap();
+    let mut e = engine_in(&tmp);
+    let a = e.create_root_idempotent(b"a", b"x").unwrap();
+    let b = e.create_root_idempotent(b"b", b"y").unwrap();
+    assert_ne!(a, b);
+}
+
+#[test]
+fn complete_with_emits_stages_outbox_entries() {
+    let tmp = tempdir().unwrap();
+    let mut e = engine_in(&tmp);
+    let id = e.create_root(b"input").unwrap();
+    let ids = e
+        .complete_with_emits(id, b"done".to_vec(), &[("topic-a", b"emit-1"), ("topic-b", b"emit-2")])
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+
+    let pending = e.pending_emits().unwrap();
+    assert_eq!(pending.len(), 2);
+    let topics: Vec<&str> = pending.iter().map(|p| p.target_topic.as_str()).collect();
+    assert!(topics.contains(&"topic-a"));
+    assert!(topics.contains(&"topic-b"));
+
+    // Marking one delivered shrinks the outbox.
+    assert!(e.mark_emit_delivered(ids[0]).unwrap());
+    let pending = e.pending_emits().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].emit_id, ids[1]);
+}
+
+#[test]
+fn complete_with_emits_is_atomic() {
+    // If we complete with emits and then reopen, both the completed state
+    // and the outbox entry must be visible — neither can land without the
+    // other.
+    let tmp = tempdir().unwrap();
+    let id = {
+        let mut e = engine_in(&tmp);
+        let id = e.create_root(b"in").unwrap();
+        e.complete_with_emits(id, b"out".to_vec(), &[("t", b"p")]).unwrap();
+        id
+    };
+    let e = engine_in(&tmp);
+    let t = e.get(id).unwrap().unwrap();
+    assert_eq!(t.status, qx_workflow::TaskStatus::Done);
+    assert_eq!(e.pending_emits().unwrap().len(), 1);
+}
+
+#[test]
+fn create_root_idempotent_survives_reopen() {
+    let tmp = tempdir().unwrap();
+    let id_before = {
+        let mut e = engine_in(&tmp);
+        e.create_root_idempotent(b"key", b"once").unwrap()
+    };
+    let mut e = engine_in(&tmp);
+    let id_after = e.create_root_idempotent(b"key", b"twice").unwrap();
+    assert_eq!(id_before, id_after);
+    assert_eq!(&e.get(id_after).unwrap().unwrap().payload[..], b"once");
 }
 
 #[test]

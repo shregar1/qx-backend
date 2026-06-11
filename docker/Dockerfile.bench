@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+#
+# Reproducible Linux bench image for qx. Used to compare sync I/O vs
+# io_uring on aarch64 Linux (Docker Desktop's VM) and to run the
+# kill -9 crash harness on a non-darwin kernel.
+#
+# Build once:
+#   docker build -t qx-bench -f docker/Dockerfile.bench docker
+#
+# Then run benches with the workspace mounted:
+#   docker run --rm \
+#     -v "$(pwd):/work" \
+#     -v qx-target-linux:/work/target \
+#     -w /work qx-bench \
+#     bash docker/bench.sh bench
+
+FROM rust:1.95
+
+# The base image installs rustc/cargo/rust-std for "1.95.0" (specific
+# patch). The workspace's rust-toolchain.toml pins channel = "1.95"
+# (loose). Rustup treats those as different toolchains and re-downloads
+# the loose channel on every invocation. Install the loose pin *and*
+# the components the workspace asks for so the resolution lands in the
+# image and never triggers a runtime sync.
+RUN rustup toolchain install 1.95 --profile minimal \
+    --component rustfmt --component clippy
+
+# build-essential is needed for crates that build with cc-rs; pkg-config
+# is paranoia in case anything starts wanting it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup

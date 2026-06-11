@@ -7,7 +7,12 @@
 mod client;
 mod error;
 mod groups;
+mod kafka;
+mod outbox;
+pub mod replication;
 mod server;
+mod triggers;
+mod txn_sweeper;
 
 pub mod proto {
     tonic::include_proto!("qx.v1");
@@ -15,4 +20,8 @@ pub mod proto {
 
 pub use client::Client;
 pub use error::{BrokerError, Result};
-pub use server::{Broker, BrokerConfig, TlsConfig};
+pub use kafka::produce::dump_produce_timings;
+pub use kafka::{KafkaConfig, ScramCredential};
+pub use replication::{NoopReplicator, ProduceCommand, Replicator};
+pub use server::{Broker, BrokerConfig, BrokerMode, ClusterConfig, TlsConfig, bind_with_retry};
+pub use triggers::TriggerConfig;

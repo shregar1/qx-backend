@@ -61,7 +61,7 @@ async fn mirror_copies_records_from_source_to_dest() {
             .await
             .unwrap();
         for r in batch {
-            all_payloads.push(r.payload);
+            all_payloads.push(r.payload.to_vec());
         }
     }
     all_payloads.sort();

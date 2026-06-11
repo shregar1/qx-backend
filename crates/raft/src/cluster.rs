@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,13 +127,22 @@ impl Cluster {
     }
 
     pub async fn append(&self, payload: Vec<u8>) -> Result<u64> {
+        // Multi-mode semantics:
+        //   - bootstrap-all-nodes-here: pick the openraft-reported
+        //     leader from `self.nodes` and call client_write.
+        //   - single-node-per-process (start_node): `self.nodes` has
+        //     only this broker's Raft instance. Call client_write on
+        //     it; openraft surfaces ForwardToLeader through the error
+        //     path when this isn't the leader. Clients retry against
+        //     the real leader broker — the same pattern Kafka uses.
         let leader = self.leader().await.ok_or(RaftError::LeaderTimeout)?;
-        let leader_node = self
+        let target = self
             .nodes
             .iter()
             .find(|n| n.id == leader)
+            .or_else(|| self.nodes.first())
             .ok_or(RaftError::UnknownNode(leader))?;
-        let resp = leader_node
+        let resp = target
             .raft
             .client_write(AppRequest { payload })
             .await
@@ -252,7 +261,7 @@ pub struct GrpcCluster {
 
 impl GrpcCluster {
     pub async fn bootstrap(dir: impl AsRef<Path>, num_nodes: u32) -> Result<Self> {
-        Self::bootstrap_inner(dir, num_nodes, None).await
+        Self::bootstrap_inner(dir, num_nodes, None, Vec::new()).await
     }
 
     /// Bootstrap with TLS on the Raft inter-node transport. `server_tls`
@@ -265,15 +274,36 @@ impl GrpcCluster {
         server_tls: crate::grpc::RaftServerTls,
         client_tls: crate::grpc::RaftClientTls,
     ) -> Result<Self> {
-        Self::bootstrap_inner(dir, num_nodes, Some((server_tls, client_tls))).await
+        Self::bootstrap_inner(dir, num_nodes, Some((server_tls, client_tls)), Vec::new()).await
+    }
+
+    /// Bootstrap an in-process gRPC-transport cluster with one apply
+    /// callback per node. Each node's `PersistentStorage` invokes its
+    /// callback synchronously whenever an entry is applied to its
+    /// state machine — drives per-replica external state (e.g. the
+    /// broker's `Topic`). Pass an empty vec to skip callbacks.
+    ///
+    /// Note: the storage replays existing log entries through the
+    /// callback on open. Callers whose external state is *also*
+    /// persistent (like `qx_topic::Topic`) must therefore start fresh
+    /// each call or accept duplicate applies. The broker integration
+    /// today only bootstraps from empty.
+    pub async fn bootstrap_with_appliers(
+        dir: impl AsRef<Path>,
+        num_nodes: u32,
+        appliers: Vec<crate::store::ApplyCallback>,
+    ) -> Result<Self> {
+        Self::bootstrap_inner(dir, num_nodes, None, appliers).await
     }
 
     async fn bootstrap_inner(
         dir: impl AsRef<Path>,
         num_nodes: u32,
         tls: Option<(crate::grpc::RaftServerTls, crate::grpc::RaftClientTls)>,
+        appliers: Vec<crate::store::ApplyCallback>,
     ) -> Result<Self> {
         assert!(num_nodes > 0);
+        assert!(appliers.is_empty() || appliers.len() == num_nodes as usize);
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
@@ -288,44 +318,20 @@ impl GrpcCluster {
             listeners.push(listener);
         }
 
-        let config = Arc::new(
-            Config {
-                heartbeat_interval: 100,
-                election_timeout_min: 300,
-                election_timeout_max: 600,
-                ..Default::default()
-            }
-            .validate()
-            .map_err(|e| RaftError::Initialise(e.to_string()))?,
-        );
-
         let mut nodes = Vec::with_capacity(num_nodes as usize);
         for (id, listener) in listeners.into_iter().enumerate() {
             let id = id as NodeId;
-            let node_dir = dir.join(format!("node-{id}"));
-            let storage = PersistentStorage::open(&node_dir).await?;
-            let (log_store, state_machine) =
-                openraft::storage::Adaptor::new(storage.clone());
-            let factory = crate::grpc::RaftGrpcFactory {
-                addrs: addrs.clone(),
-                client_tls: tls.as_ref().map(|(_, c)| c.clone()),
-            };
-            let raft = Raft::new(id, config.clone(), factory, log_store, state_machine)
-                .await
-                .map_err(|e| RaftError::Initialise(e.to_string()))?;
-            let raft = Arc::new(raft);
-
-            let svc = crate::grpc::RaftGrpcService::new(raft.clone());
-            let server_tls = tls.as_ref().map(|(s, _)| s.clone());
-            tokio::spawn(async move {
-                let _ = svc.serve_with_listener_tls(listener, server_tls).await;
-            });
-
-            nodes.push(GrpcClusterNode {
+            let cb = appliers.get(id as usize).cloned();
+            let node = start_grpc_node_internal(
                 id,
-                raft,
-                storage,
-            });
+                listener,
+                addrs.clone(),
+                dir.join(format!("node-{id}")),
+                cb,
+                tls.clone(),
+            )
+            .await?;
+            nodes.push(node);
         }
 
         let mut members = BTreeMap::new();
@@ -343,6 +349,92 @@ impl GrpcCluster {
         Ok(cluster)
     }
 
+    /// Start a SINGLE Raft node belonging to a multi-process cluster.
+    /// Each broker calls this with its own `node_id`, its bound TCP
+    /// listener for inter-node Raft RPCs, the full set of `peer_addrs`
+    /// (including itself), and an apply callback that drives its
+    /// local `Topic`. Persistent Raft state goes under `dir`.
+    ///
+    /// The returned `GrpcCluster` contains only this one node. To
+    /// bootstrap a fresh cluster on first run, ONE node (any) must
+    /// also call [`Self::initialize_membership`] after every node has
+    /// started. On restart, the persisted membership entry is re-read
+    /// from disk and `initialize_membership` must NOT be called again.
+    ///
+    /// `tls = None` runs Raft RPCs in plaintext over http; `Some(...)`
+    /// uses tonic-rustls on both server and client sides.
+    pub async fn start_node(
+        node_id: NodeId,
+        listener: tokio::net::TcpListener,
+        peer_addrs: HashMap<NodeId, String>,
+        dir: impl AsRef<Path>,
+        apply_callback: Option<crate::store::ApplyCallback>,
+        tls: Option<(crate::grpc::RaftServerTls, crate::grpc::RaftClientTls)>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        let node = start_grpc_node_internal(
+            node_id,
+            listener,
+            peer_addrs,
+            dir,
+            apply_callback,
+            tls,
+        )
+        .await?;
+        Ok(Self { nodes: vec![node] })
+    }
+
+    /// Initialize cluster membership on this node. Call from EXACTLY
+    /// ONE node in a fresh cluster after every node has started its
+    /// gRPC service. On restart this is a no-op (membership lives on
+    /// disk). `num_nodes` is the size of the cluster; member ids run
+    /// from 0..num_nodes.
+    pub async fn initialize_membership(&self, num_nodes: u32) -> Result<()> {
+        assert_eq!(self.nodes.len(), 1, "initialize_membership called on multi-node GrpcCluster — only the single-node multi-process bootstrap should use this");
+        let mut members = BTreeMap::new();
+        for id in 0..(num_nodes as NodeId) {
+            members.insert(id, BasicNode::default());
+        }
+        // openraft's `initialize` is idempotent: on a fresh node it
+        // commits the membership entry; on a re-initialised node
+        // (the membership is already in the log) it returns
+        // `NotAllowed` which we treat as success.
+        match self.nodes[0].raft.initialize(members).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Best-effort idempotency: openraft surfaces
+                // `NotAllowed` when log isn't empty / membership is
+                // already initialized. Match on the error string —
+                // openraft 0.9 doesn't expose a stable error kind
+                // for this path.
+                let s = e.to_string();
+                if s.contains("NotAllowed") || s.contains("already") {
+                    Ok(())
+                } else {
+                    Err(RaftError::Initialise(s))
+                }
+            }
+        }
+    }
+
+    /// Wait until any node in this single-node view knows of a Raft
+    /// leader. Returns the leader's `NodeId` so the broker can decide
+    /// whether to accept Produce locally (self is leader) or surface
+    /// NOT_LEADER (self is a follower).
+    pub async fn wait_for_known_leader(&self, timeout: Duration) -> Result<NodeId> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(l) = self.leader().await {
+                return Ok(l);
+            }
+            if Instant::now() >= deadline {
+                return Err(RaftError::LeaderTimeout);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     pub fn size(&self) -> u32 {
         self.nodes.len() as u32
     }
@@ -358,13 +450,22 @@ impl GrpcCluster {
     }
 
     pub async fn append(&self, payload: Vec<u8>) -> Result<u64> {
+        // Multi-mode semantics:
+        //   - bootstrap-all-nodes-here: pick the openraft-reported
+        //     leader from `self.nodes` and call client_write.
+        //   - single-node-per-process (start_node): `self.nodes` has
+        //     only this broker's Raft instance. Call client_write on
+        //     it; openraft surfaces ForwardToLeader through the error
+        //     path when this isn't the leader. Clients retry against
+        //     the real leader broker — the same pattern Kafka uses.
         let leader = self.leader().await.ok_or(RaftError::LeaderTimeout)?;
-        let leader_node = self
+        let target = self
             .nodes
             .iter()
             .find(|n| n.id == leader)
+            .or_else(|| self.nodes.first())
             .ok_or(RaftError::UnknownNode(leader))?;
-        let resp = leader_node
+        let resp = target
             .raft
             .client_write(AppRequest { payload })
             .await
@@ -443,6 +544,73 @@ impl GrpcCluster {
             sleep(Duration::from_millis(50)).await;
         }
     }
+
+    /// Trigger openraft to take a snapshot on this node's local Raft
+    /// instance. Once the snapshot is committed, openraft prunes log
+    /// entries past `max_in_snapshot_log_to_keep` — so a follower
+    /// that comes back online far enough behind has to catch up via
+    /// `InstallSnapshot` instead of log replay.
+    ///
+    /// The state-machine on-disk log (qx-topic data + apply cursor)
+    /// is independent of the Raft log and survives the prune.
+    pub async fn trigger_snapshot_on_self(&self) -> Result<()> {
+        let n = self
+            .nodes
+            .first()
+            .ok_or(RaftError::LeaderTimeout)?;
+        n.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| RaftError::ClientWrite(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Per-node construction shared by the all-in-one [`GrpcCluster::bootstrap`]
+/// and the multi-process [`GrpcCluster::start_node`]. Spawns the tonic
+/// server for inter-node Raft RPCs and builds the openraft `Raft<T>`
+/// instance.
+async fn start_grpc_node_internal(
+    id: NodeId,
+    listener: tokio::net::TcpListener,
+    addrs: HashMap<NodeId, String>,
+    node_dir: PathBuf,
+    apply_callback: Option<crate::store::ApplyCallback>,
+    tls: Option<(crate::grpc::RaftServerTls, crate::grpc::RaftClientTls)>,
+) -> Result<GrpcClusterNode> {
+    let config = Arc::new(
+        Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|e| RaftError::Initialise(e.to_string()))?,
+    );
+    let storage = PersistentStorage::open_with_callback(&node_dir, apply_callback).await?;
+    let (log_store, state_machine) = openraft::storage::Adaptor::new(storage.clone());
+    let factory = crate::grpc::RaftGrpcFactory {
+        addrs,
+        client_tls: tls.as_ref().map(|(_, c)| c.clone()),
+    };
+    let raft = Raft::new(id, config, factory, log_store, state_machine)
+        .await
+        .map_err(|e| RaftError::Initialise(e.to_string()))?;
+    let raft = Arc::new(raft);
+
+    let svc = crate::grpc::RaftGrpcService::new(raft.clone());
+    let server_tls = tls.as_ref().map(|(s, _)| s.clone());
+    tokio::spawn(async move {
+        let _ = svc.serve_with_listener_tls(listener, server_tls).await;
+    });
+
+    Ok(GrpcClusterNode {
+        id,
+        raft,
+        storage,
+    })
 }
 
 /// Disk-backed cluster: each node has its own subdirectory under `dir`
@@ -523,7 +691,7 @@ impl PersistentCluster {
             // Replay existing log so external state matches persisted state.
             if let Some(cb) = cb {
                 storage
-                    .replay_to_callback(move |bytes| cb(bytes))
+                    .replay_to_callback(move |idx, bytes| cb(idx, bytes))
                     .await?;
             }
             let (log_store, state_machine) =
@@ -562,13 +730,22 @@ impl PersistentCluster {
     }
 
     pub async fn append(&self, payload: Vec<u8>) -> Result<u64> {
+        // Multi-mode semantics:
+        //   - bootstrap-all-nodes-here: pick the openraft-reported
+        //     leader from `self.nodes` and call client_write.
+        //   - single-node-per-process (start_node): `self.nodes` has
+        //     only this broker's Raft instance. Call client_write on
+        //     it; openraft surfaces ForwardToLeader through the error
+        //     path when this isn't the leader. Clients retry against
+        //     the real leader broker — the same pattern Kafka uses.
         let leader = self.leader().await.ok_or(RaftError::LeaderTimeout)?;
-        let leader_node = self
+        let target = self
             .nodes
             .iter()
             .find(|n| n.id == leader)
+            .or_else(|| self.nodes.first())
             .ok_or(RaftError::UnknownNode(leader))?;
-        let resp = leader_node
+        let resp = target
             .raft
             .client_write(AppRequest { payload })
             .await

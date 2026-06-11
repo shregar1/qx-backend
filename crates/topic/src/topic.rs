@@ -4,7 +4,10 @@
 //! with a fair per-partition budget.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::cold_store::ColdStore;
 
 use qx_queue::{Queue, QueueConfig, ReceiptHandle};
 use qx_storage::RecordId;
@@ -13,7 +16,10 @@ use qx_storage::RecordId;
 pub struct TopicStreamedMessage {
     pub partition: u32,
     pub id: RecordId,
-    pub payload: Vec<u8>,
+    /// Refcounted slice from the disk-read buffer (`bytes::Bytes`).
+    /// Zero-copy down to qx-storage's `Segment::read` — the broker
+    /// can hand this straight to prost on the gRPC reply path.
+    pub payload: bytes::Bytes,
 }
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -51,7 +57,10 @@ pub struct TopicMessage {
     pub id: RecordId,
     pub receipt: TopicReceipt,
     pub attempts: u32,
-    pub payload: Vec<u8>,
+    /// Refcounted slice from the disk-read buffer (`bytes::Bytes`).
+    /// Zero-copy down to qx-storage's `Segment::read` — the broker
+    /// can hand this straight to prost on the gRPC reply path.
+    pub payload: bytes::Bytes,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,8 +73,15 @@ pub struct TopicStats {
 
 pub struct Topic {
     dir: PathBuf,
-    partitions: Vec<Queue>,
+    /// Each partition is independently lockable so concurrent producers
+    /// to different partitions don't serialize on a single Topic-wide
+    /// mutex. `&self` methods lock only the partition they touch.
+    partitions: Vec<Mutex<Queue>>,
     config: TopicConfig,
+    /// Optional cold-tier store. When set, `read_record` falls through
+    /// to it for records the hot tier doesn't have. Offloading from hot
+    /// to cold is explicit via `offload_to_cold`.
+    cold: Option<Arc<dyn ColdStore>>,
 }
 
 impl Topic {
@@ -90,14 +106,41 @@ impl Topic {
         let mut partitions = Vec::with_capacity(config.partition_count as usize);
         for p in 0..config.partition_count {
             let pdir = dir.join(format!("partition-{p}"));
-            partitions.push(Queue::open(&pdir, config.queue.clone())?);
+            partitions.push(Mutex::new(Queue::open(&pdir, config.queue.clone())?));
         }
 
         Ok(Self {
             dir,
             partitions,
             config,
+            cold: None,
         })
+    }
+
+    /// Attach a cold-tier store. `read_record` will fall through to it
+    /// when the hot tier returns `None`. Pure addition — does not
+    /// migrate any existing hot data.
+    pub fn with_cold_store(mut self, store: Arc<dyn ColdStore>) -> Self {
+        self.cold = Some(store);
+        self
+    }
+
+    /// Offload the record at `(partition, id)` to the cold tier (if
+    /// configured) without removing it from the hot tier. Intended to
+    /// run inside a retention sweeper that bulk-offloads then advances
+    /// a broker-level low watermark. Returns `Ok(false)` when no cold
+    /// store is attached or when the hot tier doesn't have the record.
+    pub fn offload_to_cold(&self, partition: u32, id: RecordId) -> Result<bool> {
+        let Some(cold) = self.cold.as_ref() else {
+            return Ok(false);
+        };
+        let idx = self.check_partition(partition)?;
+        let payload = match self.partitions[idx].lock().unwrap().read_record(id) {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+        cold.put(partition, id, &payload)?;
+        Ok(true)
     }
 
     pub fn partition_count(&self) -> u32 {
@@ -109,39 +152,87 @@ impl Topic {
         (h % self.config.partition_count as u64) as u32
     }
 
-    pub fn send(&mut self, key: &[u8], payload: &[u8]) -> Result<(u32, RecordId)> {
+    pub fn send(&self, key: &[u8], payload: &[u8]) -> Result<(u32, RecordId)> {
         let p = self.partition_for_key(key);
-        let id = self.partitions[p as usize].send(payload)?;
+        let id = self.partitions[p as usize].lock().unwrap().send(payload)?;
         Ok((p, id))
     }
 
-    pub fn send_to(&mut self, partition: u32, payload: &[u8]) -> Result<RecordId> {
+    pub fn send_to(&self, partition: u32, payload: &[u8]) -> Result<RecordId> {
         let idx = self.check_partition(partition)?;
-        Ok(self.partitions[idx].send(payload)?)
+        Ok(self.partitions[idx].lock().unwrap().send(payload)?)
     }
 
-    pub fn send_keyed(&mut self, key: &[u8], payload: &[u8]) -> Result<(u32, RecordId)> {
+    /// Refcounted-buffer variant of [`Self::send_to`]. Callers that
+    /// already hold a `Bytes` (outbox dispatcher, forwarding paths)
+    /// pass the buffer through without an intermediate slice
+    /// borrow. Internally the bytes are passed to the underlying
+    /// `Queue::send` as `&[u8]`.
+    pub fn send_to_bytes(
+        &self,
+        partition: u32,
+        payload: bytes::Bytes,
+    ) -> Result<RecordId> {
+        let idx = self.check_partition(partition)?;
+        Ok(self.partitions[idx]
+            .lock()
+            .unwrap()
+            .send(payload.as_ref())?)
+    }
+
+    /// Batch-append `payloads` to a single partition under one redb
+    /// commit. ~N× faster than calling `send_to` N times because every
+    /// per-record commit otherwise triggers an fsync. Locks only this
+    /// partition — concurrent calls to different partitions don't block.
+    pub fn send_batch_to(
+        &self,
+        partition: u32,
+        payloads: &[&[u8]],
+    ) -> Result<Vec<RecordId>> {
+        let idx = self.check_partition(partition)?;
+        Ok(self.partitions[idx].lock().unwrap().send_batch(payloads)?)
+    }
+
+    /// Apply `payloads` to `partition` under a Raft apply-cursor
+    /// guard. Returns `Ok(None)` when `raft_index` is `<=` the
+    /// partition's persisted cursor (duplicate apply from openraft's
+    /// crash-recovery path). Atomically: the cursor write and the
+    /// topic data write are in one redb transaction.
+    pub fn send_batch_with_cursor(
+        &self,
+        partition: u32,
+        payloads: &[&[u8]],
+        raft_index: u64,
+    ) -> Result<Option<Vec<RecordId>>> {
+        let idx = self.check_partition(partition)?;
+        Ok(self.partitions[idx]
+            .lock()
+            .unwrap()
+            .send_batch_with_cursor(payloads, raft_index)?)
+    }
+
+    pub fn send_keyed(&self, key: &[u8], payload: &[u8]) -> Result<(u32, RecordId)> {
         let p = self.partition_for_key(key);
-        let id = self.partitions[p as usize].send_keyed(key, payload)?;
+        let id = self.partitions[p as usize].lock().unwrap().send_keyed(key, payload)?;
         Ok((p, id))
     }
 
-    pub fn compact_by_key(&mut self) -> Result<usize> {
+    pub fn compact_by_key(&self) -> Result<usize> {
         let mut total = 0;
-        for q in &mut self.partitions {
-            total += q.compact_by_key()?;
+        for q in &self.partitions {
+            total += q.lock().unwrap().compact_by_key()?;
         }
         Ok(total)
     }
 
     pub fn stream(
-        &mut self,
+        &self,
         group: &str,
         partition: u32,
         max: usize,
     ) -> Result<Vec<TopicStreamedMessage>> {
         let idx = self.check_partition(partition)?;
-        let msgs = self.partitions[idx].stream(group, max)?;
+        let msgs = self.partitions[idx].lock().unwrap().stream(group, max)?;
         Ok(msgs
             .into_iter()
             .map(|m| TopicStreamedMessage {
@@ -153,22 +244,48 @@ impl Topic {
     }
 
     pub fn commit_offset(
-        &mut self,
+        &self,
         group: &str,
         partition: u32,
         offset: RecordId,
     ) -> Result<()> {
         let idx = self.check_partition(partition)?;
-        self.partitions[idx].commit_offset(group, offset)?;
+        self.partitions[idx].lock().unwrap().commit_offset(group, offset)?;
         Ok(())
     }
 
     pub fn group_offset(&self, group: &str, partition: u32) -> Result<Option<RecordId>> {
         let idx = self.check_partition(partition)?;
-        Ok(self.partitions[idx].group_offset(group)?)
+        Ok(self.partitions[idx].lock().unwrap().group_offset(group)?)
     }
 
-    pub fn send_batch(&mut self, items: &[(&[u8], &[u8])]) -> Result<Vec<(u32, RecordId)>> {
+    /// High-watermark: id of the next record that would be assigned in
+    /// this partition. Kafka clients call this the "log end offset".
+    pub fn partition_end_offset(&self, partition: u32) -> Result<RecordId> {
+        let idx = self.check_partition(partition)?;
+        Ok(self.partitions[idx].lock().unwrap().next_record_id())
+    }
+
+    /// Read one record by `id` from `partition`. Falls through to the
+    /// cold tier (if attached) when the hot tier doesn't have it —
+    /// either because the id is past the end of the hot log or because
+    /// retention truncated it.
+    pub fn read_record(&self, partition: u32, id: RecordId) -> Result<Option<bytes::Bytes>> {
+        let idx = self.check_partition(partition)?;
+        let hot = self.partitions[idx].lock().unwrap().read_record(id);
+        if hot.is_some() {
+            return Ok(hot);
+        }
+        if let Some(cold) = self.cold.as_ref() {
+            // Cold tier still returns `Vec<u8>` (it's a separate
+            // file-system backend); wrap it via the same zero-cost
+            // move trick.
+            return Ok(cold.get(partition, id)?.map(bytes::Bytes::from));
+        }
+        Ok(None)
+    }
+
+    pub fn send_batch(&self, items: &[(&[u8], &[u8])]) -> Result<Vec<(u32, RecordId)>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -185,7 +302,7 @@ impl Topic {
                 continue;
             }
             let payloads: Vec<&[u8]> = indices.iter().map(|i| items[*i].1).collect();
-            let ids = self.partitions[p_idx].send_batch(&payloads)?;
+            let ids = self.partitions[p_idx].lock().unwrap().send_batch(&payloads)?;
             for (i, id) in indices.iter().zip(ids.iter()) {
                 results[*i] = (p_idx as u32, *id);
             }
@@ -193,7 +310,7 @@ impl Topic {
         Ok(results)
     }
 
-    pub fn receive(&mut self, max: usize) -> Result<Vec<TopicMessage>> {
+    pub fn receive(&self, max: usize) -> Result<Vec<TopicMessage>> {
         if max == 0 {
             return Ok(Vec::new());
         }
@@ -205,7 +322,7 @@ impl Topic {
                 break;
             }
             let need = (max - out.len()).min(per_partition);
-            let msgs = self.partitions[p_idx].receive(need)?;
+            let msgs = self.partitions[p_idx].lock().unwrap().receive(need)?;
             for m in msgs {
                 out.push(wrap_message(p_idx as u32, m));
             }
@@ -213,27 +330,27 @@ impl Topic {
         Ok(out)
     }
 
-    pub fn receive_from(&mut self, partition: u32, max: usize) -> Result<Vec<TopicMessage>> {
+    pub fn receive_from(&self, partition: u32, max: usize) -> Result<Vec<TopicMessage>> {
         let idx = self.check_partition(partition)?;
-        let msgs = self.partitions[idx].receive(max)?;
+        let msgs = self.partitions[idx].lock().unwrap().receive(max)?;
         Ok(msgs.into_iter().map(|m| wrap_message(partition, m)).collect())
     }
 
-    pub fn ack(&mut self, receipt: TopicReceipt) -> Result<()> {
+    pub fn ack(&self, receipt: TopicReceipt) -> Result<()> {
         let idx = self.check_partition(receipt.partition)?;
-        self.partitions[idx].ack(receipt.inner)?;
+        self.partitions[idx].lock().unwrap().ack(receipt.inner)?;
         Ok(())
     }
 
-    pub fn nack(&mut self, receipt: TopicReceipt) -> Result<()> {
+    pub fn nack(&self, receipt: TopicReceipt) -> Result<()> {
         let idx = self.check_partition(receipt.partition)?;
-        self.partitions[idx].nack(receipt.inner)?;
+        self.partitions[idx].lock().unwrap().nack(receipt.inner)?;
         Ok(())
     }
 
-    pub fn extend_visibility(&mut self, receipt: TopicReceipt, ext: Duration) -> Result<()> {
+    pub fn extend_visibility(&self, receipt: TopicReceipt, ext: Duration) -> Result<()> {
         let idx = self.check_partition(receipt.partition)?;
-        self.partitions[idx].extend_visibility(receipt.inner, ext)?;
+        self.partitions[idx].lock().unwrap().extend_visibility(receipt.inner, ext)?;
         Ok(())
     }
 
@@ -243,7 +360,7 @@ impl Topic {
             ..Default::default()
         };
         for q in &self.partitions {
-            let s = q.stats()?;
+            let s = q.lock().unwrap().stats()?;
             stats.pending += s.pending;
             stats.inflight += s.inflight;
             stats.dead += s.dead;
@@ -281,6 +398,13 @@ fn wrap_message(partition: u32, msg: qx_queue::Message) -> TopicMessage {
 
 fn meta_path(dir: &Path) -> PathBuf {
     dir.join(META_FILENAME)
+}
+
+/// Public: peek at the partition count an existing topic dir was opened
+/// with, without actually opening the partition logs. Used by callers
+/// that need to discover topics on disk at startup (e.g. broker recovery).
+pub fn read_partition_count(dir: impl AsRef<Path>) -> Result<Option<u32>> {
+    read_meta(dir.as_ref())
 }
 
 fn write_meta(dir: &Path, partition_count: u32) -> Result<()> {

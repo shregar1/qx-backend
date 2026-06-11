@@ -70,6 +70,11 @@ impl RaftGrpcService {
         listener: TcpListener,
         tls: Option<RaftServerTls>,
     ) -> std::result::Result<(), tonic::transport::Error> {
+        // rustls 0.23 needs a process-wide CryptoProvider before any TLS
+        // handshake. We install `ring` lazily; broker startup also calls
+        // this, so two binaries that link both still cooperate.
+        install_default_crypto_provider();
+
         let stream = TcpListenerStream::new(listener);
         let mut builder = Server::builder();
         if let Some(t) = tls {
@@ -240,6 +245,7 @@ async fn connect(
 ) -> std::result::Result<proto::raft_client::RaftClient<Channel>, tonic::transport::Error> {
     let mut endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())?;
     if let Some(t) = tls {
+        install_default_crypto_provider();
         let config = tonic::transport::ClientTlsConfig::new()
             .ca_certificate(tonic::transport::Certificate::from_pem(t.ca_pem.clone()))
             .domain_name(t.domain.clone());
@@ -247,6 +253,17 @@ async fn connect(
     }
     let channel = endpoint.connect().await?;
     Ok(proto::raft_client::RaftClient::new(channel))
+}
+
+/// Install the `ring` CryptoProvider once per process for rustls 0.23.
+/// Idempotent: subsequent calls (or other crates that already installed
+/// a provider) silently no-op via the swallowed `Err`.
+fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn unreachable<E, T>(e: E) -> RPCError<NodeId, BasicNode, T>

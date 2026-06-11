@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for rec in &batch {
                 // For each order, kick off a workflow task
                 let task_id = consumer
-                    .create_root_task(WORKFLOW, rec.payload.clone())
+                    .create_root_task(WORKFLOW, rec.payload.to_vec())
                     .await?;
                 tasks.push(task_id);
                 consumer

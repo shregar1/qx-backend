@@ -48,8 +48,12 @@ pub struct Task {
     pub parent_id: Option<TaskId>,
     pub status: TaskStatus,
     pub created_nanos: u64,
-    pub payload: Vec<u8>,
-    pub result: Option<Vec<u8>>,
+    /// Refcounted slice. On decode the bytes are wrapped via
+    /// `Bytes::copy_from_slice` (a single alloc the redb-deserialise
+    /// path was already paying); on the read-back path the broker
+    /// hands these straight to prost without re-buffering.
+    pub payload: bytes::Bytes,
+    pub result: Option<bytes::Bytes>,
     pub error: Option<String>,
 }
 
@@ -94,7 +98,8 @@ impl Task {
         if bytes.len() < cursor + payload_len {
             return Err(WorkflowError::CorruptTask);
         }
-        let payload = bytes[cursor..cursor + payload_len].to_vec();
+        let payload =
+            bytes::Bytes::copy_from_slice(&bytes[cursor..cursor + payload_len]);
         cursor += payload_len;
 
         if bytes.len() < cursor + 4 {
@@ -106,7 +111,9 @@ impl Task {
             return Err(WorkflowError::CorruptTask);
         }
         let result = if result_len > 0 {
-            Some(bytes[cursor..cursor + result_len].to_vec())
+            Some(bytes::Bytes::copy_from_slice(
+                &bytes[cursor..cursor + result_len],
+            ))
         } else {
             None
         };
@@ -152,7 +159,7 @@ mod tests {
             parent_id: None,
             status: TaskStatus::Pending,
             created_nanos: 12345,
-            payload: b"work".to_vec(),
+            payload: bytes::Bytes::from_static(b"work"),
             result: None,
             error: None,
         };
@@ -160,7 +167,7 @@ mod tests {
         let decoded = Task::decode(0, &bytes).unwrap();
         assert!(decoded.parent_id.is_none());
         assert_eq!(decoded.status, TaskStatus::Pending);
-        assert_eq!(decoded.payload, b"work");
+        assert_eq!(&decoded.payload[..], b"work");
         assert!(decoded.result.is_none());
         assert!(decoded.error.is_none());
     }
@@ -172,8 +179,8 @@ mod tests {
             parent_id: Some(2),
             status: TaskStatus::Done,
             created_nanos: 0,
-            payload: b"in".to_vec(),
-            result: Some(b"out".to_vec()),
+            payload: bytes::Bytes::from_static(b"in"),
+            result: Some(bytes::Bytes::from_static(b"out")),
             error: None,
         };
         let bytes = t.encode();
@@ -189,7 +196,7 @@ mod tests {
             parent_id: Some(1),
             status: TaskStatus::Failed,
             created_nanos: 0,
-            payload: vec![],
+            payload: bytes::Bytes::new(),
             result: None,
             error: Some("boom".into()),
         };

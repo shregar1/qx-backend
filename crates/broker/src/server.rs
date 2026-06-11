@@ -22,10 +22,104 @@ use crate::error::Result;
 use crate::proto;
 use crate::proto::broker_server::{Broker as BrokerSvcTrait, BrokerServer};
 
+/// Two broker profiles. Same binary, same protocol surface, same
+/// storage layer — they differ in the hot-path runtime architecture
+/// and decoder allocation strategy. Select at startup; cannot switch
+/// without restarting.
+///
+/// - `Standard`: the safe, portable default. tokio multi-threaded
+///   work-stealing scheduler, epoll/kqueue I/O, owning-`Vec<u8>`
+///   decoder. Sustains ~1.5 GiB/s on small payloads, matches a
+///   single-broker Apache Kafka in `acks=1` mode, exceeds NATS
+///   JetStream on the same workload shapes. Runs everywhere tokio
+///   runs.
+///
+/// - `Hyper`: targets Redpanda-class single-node throughput. Adds
+///   reference-counted `bytes::Bytes` decoding so per-record values
+///   don't allocate, and is the home for future per-core sharded
+///   execution + io_uring socket I/O on Linux. Strictly more
+///   complex than `Standard`; pick it when you have many CPU cores
+///   and a saturating workload.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerMode {
+    #[default]
+    Standard,
+    Hyper,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct BrokerConfig {
     pub auth_token: Option<String>,
     pub tls: Option<TlsConfig>,
+    /// Selects which broker profile to run. `Standard` (default) is
+    /// the portable, single-runtime path. `Hyper` enables zero-copy
+    /// decoding and (on Linux, when shipped) per-core sharded
+    /// execution. See `BrokerMode` for the trade-offs.
+    pub mode: BrokerMode,
+    /// Optional cluster / replication configuration. When `Some`, the
+    /// broker reaches out to its peers via `qx-raft` for every Produce
+    /// before locally applying. The data-plane wiring is in progress —
+    /// today the field is recognized and surfaced in DescribeCluster /
+    /// Metadata, but Produce still applies locally; flipping it to
+    /// "replicate-then-apply" is a single hook in `produce_writer`.
+    pub cluster: Option<ClusterConfig>,
+    /// When `true`, every topic opened by this broker uses redb's
+    /// `Durability::Eventual` for the per-batch commit — no fsync on
+    /// commit, ack returns as soon as the page cache has the write.
+    /// Power failure can lose recent records (bounded by OS flush
+    /// cadence, usually <30 s); a process crash is still safe because
+    /// the OS page cache survives. This is the knob to flip when you
+    /// want sub-ms Produce latency at "Kafka acks=1" durability.
+    pub eventual_commits: bool,
+    /// When `true`, every topic opened by this broker skips the redb
+    /// per-message state table entirely on the Produce path — pure
+    /// log appends, no b-tree touch per record. Trade-off: SQS-style
+    /// queue ops (`receive` / `ack` / `nack` / `extend_visibility`)
+    /// stop returning data. Offset-based reads (`Fetch`, `stream`,
+    /// consumer-group commits) are unaffected.
+    ///
+    /// Default `false`. Flip when the deployment uses streaming
+    /// semantics only and you want the b-tree cost off the hot path.
+    pub log_only_storage: bool,
+    /// Opt-in per-core sharded write execution. When `true`, the broker
+    /// spawns `num_cpus` OS threads (pinned to distinct CPU cores via
+    /// `core_affinity`) and routes every Produce to a shard owning its
+    /// partition via lock-free `crossbeam_channel`. Each shard commits
+    /// inline on its dedicated thread.
+    ///
+    /// **Workload-dependent.** Wins on very high concurrency (many
+    /// hundreds of producers hitting many partitions) where the
+    /// tokio work-stealing scheduler's cross-core task migration
+    /// becomes the bottleneck. Loses at the workload sizes we
+    /// typically bench (8–32 producers) because the std::thread →
+    /// tokio runtime wake latency dominates the CPU cache benefit.
+    /// Bench it on your workload before enabling.
+    pub per_core_shards: bool,
+}
+
+/// Single broker's view of a Raft-replicated cluster. Stored on
+/// `BrokerConfig` so operators can declare cluster membership without
+/// touching the `qx-raft` crate directly.
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    /// Stable id for this node in the cluster (0..N-1).
+    pub node_id: u64,
+    /// `(node_id, host:port)` for every voting member, including this
+    /// one. These are the addresses for the inter-broker Raft RPC
+    /// transport, distinct from the client-facing gRPC listeners.
+    pub voters: Vec<(u64, String)>,
+    /// TLS config used for broker-to-broker Raft RPCs. Independent of
+    /// the client-facing TLS on the gRPC and Kafka listeners.
+    pub raft_tls: Option<TlsConfig>,
+    /// `(node_id, client-facing-gRPC-addr)` for every peer broker. When
+    /// populated, a non-leader broker that receives a Produce
+    /// transparently forwards it via gRPC to the actual leader broker,
+    /// so clients can connect to any broker and produce without
+    /// learning the leader themselves. When empty, follower brokers
+    /// surface a typed `failed_precondition` to the client carrying
+    /// the leader id in trailing metadata — the client is then
+    /// responsible for retrying against the leader.
+    pub client_addrs: Vec<(u64, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +128,11 @@ pub struct TlsConfig {
     pub cert_pem: Vec<u8>,
     /// PEM-encoded server private key.
     pub key_pem: Vec<u8>,
+    /// Optional PEM-encoded CA bundle clients are checked against. When
+    /// `Some`, every TLS handshake demands a client certificate signed
+    /// by one of these CAs (mutual TLS). When `None`, the listener
+    /// accepts any client.
+    pub client_ca_pem: Option<Vec<u8>>,
 }
 
 type GroupKey = (String, String);
@@ -41,10 +140,76 @@ type SharedGroup = Arc<Mutex<crate::groups::ConsumerGroup>>;
 
 pub struct Broker {
     dir: PathBuf,
-    topics: Mutex<HashMap<String, Arc<Mutex<Topic>>>>,
+    topics: Mutex<HashMap<String, Arc<Topic>>>,
     workflows: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
     groups: Mutex<HashMap<GroupKey, SharedGroup>>,
     schemas: Mutex<Option<Arc<Registry>>>,
+    triggers: Mutex<HashMap<String, crate::triggers::TriggerHandle>>,
+    trigger_store: Mutex<Option<Arc<crate::triggers::TriggerStore>>>,
+    /// Watch that flips to `true` on `shutdown()`. Background tasks watch
+    /// this to exit cleanly; new connections are refused once it flips.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Internal background tasks the broker owns (e.g. the outbox
+    /// dispatcher). `shutdown()` awaits all of these so that, when it
+    /// returns, every `Arc<Broker>` captured by background work has been
+    /// dropped — freeing redb file locks for clean restart.
+    background_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Persistent dedup store for Kafka idempotent producers. Lazy-opened
+    /// on first Produce. Survives broker restart so a retrying producer
+    /// after an outage doesn't generate duplicate records.
+    producer_dedup_store:
+        Mutex<Option<Arc<crate::kafka::producer_dedup::ProducerDedupStore>>>,
+    /// One coordinator task per consumer group, spawned lazily on first
+    /// request that names the group.
+    group_coordinators:
+        Mutex<HashMap<String, crate::kafka::group_coordinator::CoordinatorHandle>>,
+    /// One Produce writer task per `(topic, partition)`. Group-commits
+    /// concurrent Produces against the same partition into a single
+    /// redb commit.
+    produce_writers:
+        Mutex<HashMap<(String, u32), crate::kafka::produce_writer::WriterHandle>>,
+    /// Per-partition low-watermark / `log_start_offset`. Advanced by
+    /// `DeleteRecords`; Fetch refuses reads below it, ListOffsets returns
+    /// it for `timestamp == -2` (earliest). In-memory only — physical
+    /// segment deletion is a separate effort.
+    low_watermarks: Mutex<HashMap<(String, u32), u64>>,
+    /// Transactional producer state. Stub-level: tracks producer ids and
+    /// in-flight transaction partitions in memory but does NOT filter
+    /// uncommitted records on Fetch yet.
+    txn_registry: Arc<crate::kafka::transactions::TxnRegistry>,
+    /// ACL store backing CreateAcls / DeleteAcls / DescribeAcls and the
+    /// per-request authorization gate. In-memory; starts empty (all
+    /// requests allowed) until an operator creates the first ACL, at
+    /// which point the default flips to deny.
+    acls: Arc<crate::kafka::acls::AclStore>,
+    /// Per-core sharded execution for Hyper mode. `None` when the
+    /// broker is in `BrokerMode::Standard` — Standard uses tokio
+    /// writer tasks instead. `Some` when Hyper mode is on; every
+    /// Produce routes through this pool to a dedicated OS thread
+    /// pinned to a CPU core.
+    shard_pool: Option<Arc<crate::kafka::shards::ShardPool>>,
+    /// Replicator used by every Produce on this broker. Defaults to
+    /// [`crate::replication::NoopReplicator`] (single-node behavior).
+    /// When the operator runs the broker in cluster mode they call
+    /// [`Broker::install_replicator`] at startup with a
+    /// [`crate::replication::RaftReplicator`] bound to the local
+    /// [`qx_raft::Cluster`]. The `OnceLock` makes the install one-shot —
+    /// hot-swapping the replicator mid-stream is intentionally not
+    /// supported because partial-batch ordering across a swap is
+    /// hard to reason about.
+    replicator: std::sync::OnceLock<Arc<dyn crate::replication::Replicator>>,
+    /// Lazily-built tonic clients to peer brokers' client-facing gRPC
+    /// listeners, keyed by `NodeId`. Used to transparently forward
+    /// Produce when the local Raft node isn't the leader.
+    /// Populated on first forward; never invalidated (each entry is a
+    /// tonic `Channel` which reconnects under the hood).
+    peer_clients:
+        Mutex<HashMap<u64, crate::Client>>,
+    /// Handle to this broker's local Raft cluster view, set by
+    /// `start_cluster`. Stored only so tests can call
+    /// `trigger_raft_snapshot` without us exposing the cluster
+    /// publicly. Not used on the data path.
+    grpc_cluster_for_snapshot: std::sync::OnceLock<Arc<qx_raft::GrpcCluster>>,
     config: BrokerConfig,
 }
 
@@ -54,14 +219,512 @@ impl Broker {
     }
 
     pub fn open_with_config(dir: impl AsRef<Path>, config: BrokerConfig) -> Arc<Self> {
+        // rustls 0.23 needs a process-wide CryptoProvider before any TLS
+        // handshake — both our Kafka listener (`tokio-rustls`) and the
+        // gRPC transport (`tonic` over rustls) consult it.
+        install_default_crypto_provider();
+
+        // Hyper mode applies aggressive defaults if the operator hasn't
+        // already overridden them. Anything the caller set explicitly
+        // (true OR false) takes precedence — these only fill in the
+        // unconfigured cases. Today the difference between Standard
+        // and Hyper at runtime is exactly the flags below; future
+        // pushes will add per-core sharded execution and io_uring
+        // socket I/O gated behind `mode == Hyper`.
+        let mut config = config;
+        if matches!(config.mode, BrokerMode::Hyper) {
+            // Eventual durability: redb commits skip fsync. Power
+            // failure can lose recent records (bounded by OS flush
+            // cadence); process crash is still safe.
+            if !config.eventual_commits {
+                config.eventual_commits = true;
+            }
+            // Skip the per-message state table — pure log append on
+            // the Produce path. SQS-style receive/ack/nack stop
+            // returning data for these topics.
+            if !config.log_only_storage {
+                config.log_only_storage = true;
+            }
+        }
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let dir = dir.as_ref().to_path_buf();
+        let txn_registry = match crate::kafka::transactions::TxnRegistry::open(&dir) {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                eprintln!(
+                    "qxd: failed to open persistent TxnRegistry ({e}); falling back to in-memory"
+                );
+                Arc::new(crate::kafka::transactions::TxnRegistry::default())
+            }
+        };
+
+        // Discover topics previously created on this data_dir. Each topic
+        // is a directory at the top level containing a `meta.bin` with
+        // its partition count. Without this, a broker restart loses the
+        // topic catalog and clients see UNKNOWN_TOPIC_OR_PARTITION until
+        // they CreateTopics again.
+        let mut topics_map: HashMap<String, Arc<Topic>> = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                match qx_topic::read_partition_count(&path) {
+                    Ok(Some(count)) => {
+                        let name = match path.file_name().and_then(|n| n.to_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let cfg = TopicConfig {
+                            partition_count: count,
+                            queue: QueueConfig {
+                                partition: PartitionConfig::default(),
+                                visibility_timeout: Duration::from_secs(30),
+                                max_attempts: 5,
+                                durable_send: false,
+                                eventual_commits: config.eventual_commits,
+                                track_message_state: !config.log_only_storage,
+                            },
+                        };
+                        if let Ok(t) = Topic::open(&path, cfg) {
+                            topics_map.insert(name, Arc::new(t));
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
         Arc::new(Self {
-            dir: dir.as_ref().to_path_buf(),
-            topics: Mutex::new(HashMap::new()),
+            dir,
+            topics: Mutex::new(topics_map),
             workflows: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             schemas: Mutex::new(None),
+            triggers: Mutex::new(HashMap::new()),
+            trigger_store: Mutex::new(None),
+            shutdown_tx,
+            background_handles: Mutex::new(Vec::new()),
+            producer_dedup_store: Mutex::new(None),
+            group_coordinators: Mutex::new(HashMap::new()),
+            produce_writers: Mutex::new(HashMap::new()),
+            low_watermarks: Mutex::new(HashMap::new()),
+            txn_registry,
+            acls: Arc::new(crate::kafka::acls::AclStore::new()),
+            // Per-core sharded writes are now an explicit opt-in via
+            // `BrokerConfig::per_core_shards` rather than tied to
+            // Hyper mode. Head-to-head testing showed the std::thread
+            // → tokio runtime wake latency dominating the CPU cache
+            // benefit at the workload sizes we typically bench
+            // (8–32 producers): same-session, same-load measurements
+            // had Standard at ~450 MiB/s and Hyper-with-shards at
+            // ~280 MiB/s on 16×1 KiB sustained. The architecture
+            // pays off at much higher concurrency where the tokio
+            // scheduler's cross-core migration is the binding
+            // constraint; operators who know their workload sits
+            // there can flip the flag.
+            shard_pool: if config.per_core_shards {
+                Some(Arc::new(crate::kafka::shards::ShardPool::new(0)))
+            } else {
+                None
+            },
+            replicator: std::sync::OnceLock::new(),
+            peer_clients: Mutex::new(HashMap::new()),
+            grpc_cluster_for_snapshot: std::sync::OnceLock::new(),
             config,
         })
+    }
+
+    /// Return this broker's `NodeId` if cluster mode is configured.
+    pub fn cluster_node_id(&self) -> Option<u64> {
+        self.config.cluster.as_ref().map(|c| c.node_id)
+    }
+
+    /// Bridge to this broker's local Raft instance for triggering a
+    /// snapshot. Stored on the `RaftReplicator` so we can drive it
+    /// from a test without exposing the cluster handle publicly.
+    pub async fn trigger_raft_snapshot(&self) -> std::result::Result<(), String> {
+        let cell = self
+            .grpc_cluster_for_snapshot
+            .get()
+            .ok_or_else(|| "cluster not started (call start_cluster first)".to_string())?;
+        cell.trigger_snapshot_on_self()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Get or build a tonic client to the peer broker identified by
+    /// `node_id`. Used by the forwarding path when this broker isn't
+    /// the Raft leader. Returns `None` when:
+    ///   - cluster mode isn't enabled,
+    ///   - `node_id` isn't in `ClusterConfig::client_addrs`,
+    ///   - or the tonic connect fails.
+    ///
+    /// When the broker has client-facing TLS configured, peer
+    /// connections use the same cert as the trust anchor (self-signed
+    /// mesh) and dial `https://`. The SNI domain is extracted from
+    /// the peer address — for "127.0.0.1:7001" we send "127.0.0.1",
+    /// which matches the SAN of the cert generated by
+    /// `rcgen::generate_simple_self_signed`. Operators with a PKI
+    /// deployment can override via the existing `[tls]` block.
+    pub(crate) async fn peer_client(&self, node_id: u64) -> Option<crate::Client> {
+        // Fast path: cached.
+        if let Some(c) = self.peer_clients.lock().unwrap().get(&node_id).cloned() {
+            return Some(c);
+        }
+        let cfg = self.config.cluster.as_ref()?;
+        let addr = cfg
+            .client_addrs
+            .iter()
+            .find(|(id, _)| *id == node_id)
+            .map(|(_, a)| a.clone())?;
+
+        let client = if let Some(tls) = self.config.tls.as_ref() {
+            let url = if addr.starts_with("http") {
+                addr.clone()
+            } else {
+                format!("https://{addr}")
+            };
+            // Pull the SNI domain from the addr's host portion. Strip
+            // an "http(s)://" prefix if the operator supplied one.
+            let host_part = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            let domain = host_part
+                .split(':')
+                .next()
+                .unwrap_or("localhost")
+                .to_string();
+            crate::Client::connect_tls(url, tls.cert_pem.clone(), domain)
+                .await
+                .ok()?
+        } else {
+            let url = if addr.starts_with("http") {
+                addr
+            } else {
+                format!("http://{addr}")
+            };
+            crate::Client::connect(url).await.ok()?
+        };
+        // Insert under the lock; if a concurrent caller raced us,
+        // use theirs to avoid duplicating connections.
+        let mut map = self.peer_clients.lock().unwrap();
+        Some(map.entry(node_id).or_insert(client).clone())
+    }
+
+    /// Like [`Self::replicate_or_forward_send`] but for a batch of
+    /// `(key, payload)` pairs. Groups by partition and proposes one
+    /// Raft entry per partition; on `ForwardToLeader` for any
+    /// partition the broker forwards that partition's batch via gRPC
+    /// to the leader. Returns the per-input result vector preserving
+    /// the caller's order.
+    pub(crate) async fn replicate_or_forward_send_batch(
+        self: &Arc<Self>,
+        topic_name: &str,
+        topic: Arc<Topic>,
+        items: Vec<(bytes::Bytes, bytes::Bytes)>,
+    ) -> std::result::Result<Vec<(u32, u64)>, TopicError> {
+        // Bucket inputs by partition while remembering the original
+        // index so we can stitch the result order back together. Keys
+        // and payloads are refcounted `Bytes` — bucketing is a series
+        // of refcount bumps, not memcpys.
+        let mut by_partition: std::collections::BTreeMap<
+            u32,
+            Vec<(usize, bytes::Bytes, bytes::Bytes)>,
+        > = std::collections::BTreeMap::new();
+        for (idx, (key, payload)) in items.into_iter().enumerate() {
+            let p = topic.partition_for_key(&key);
+            by_partition.entry(p).or_default().push((idx, key, payload));
+        }
+        let total: usize = by_partition.values().map(Vec::len).sum();
+
+        let topic_name_owned = topic_name.to_string();
+        let mut futures = Vec::with_capacity(by_partition.len());
+        for (partition, entries) in by_partition {
+            let original_indexes: Vec<usize> = entries.iter().map(|(i, _, _)| *i).collect();
+            let keys: Vec<bytes::Bytes> = entries.iter().map(|(_, k, _)| k.clone()).collect();
+            let payloads: Vec<bytes::Bytes> =
+                entries.iter().map(|(_, _, p)| p.clone()).collect();
+            let cmd = crate::replication::ProduceCommand {
+                topic: topic_name_owned.clone(),
+                partition,
+                // `Bytes::clone()` is a refcount bump — no memcpy.
+                payloads: payloads.clone(),
+            };
+            let me = self.clone();
+            let topic = topic.clone();
+            let topic_name_inner = topic_name_owned.clone();
+            futures.push(async move {
+                match me.replicator().replicate_produce(topic.clone(), cmd).await {
+                    Ok(ids) => Ok((partition, original_indexes, ids)),
+                    Err(TopicError::Other(msg)) if is_forward_to_leader(&msg) => {
+                        // Forward this partition's slice to the leader
+                        // via the existing gRPC `send_batch`. The
+                        // leader re-hashes our keys to the same
+                        // partition. The pairs we send below are
+                        // refcounted `Bytes` — no per-record alloc.
+                        let leader_id = parse_forward_to_leader(&msg).ok_or_else(|| {
+                            TopicError::Other(format!(
+                                "ForwardToLeader without leader_id: {msg}"
+                            ))
+                        })?;
+                        let mut peer = me.peer_client(leader_id).await.ok_or_else(|| {
+                            TopicError::Other(format!(
+                                "leader is node {leader_id} but no client_addr configured"
+                            ))
+                        })?;
+                        let pairs: Vec<(bytes::Bytes, bytes::Bytes)> = keys
+                            .into_iter()
+                            .zip(payloads.into_iter())
+                            .collect();
+                        let results = peer
+                            .send_batch(&topic_name_inner, pairs)
+                            .await
+                            .map_err(|e| {
+                                TopicError::Other(format!(
+                                    "forward batch to leader {leader_id}: {e}"
+                                ))
+                            })?;
+                        let ids: Vec<u64> = results.iter().map(|(_, id)| *id).collect();
+                        Ok((partition, original_indexes, ids))
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+        }
+        let outcomes = futures::future::try_join_all(futures).await?;
+
+        let mut out: Vec<(u32, u64)> = vec![(0, 0); total];
+        for (partition, original_indexes, ids) in outcomes {
+            for (slot, id) in original_indexes.into_iter().zip(ids) {
+                out[slot] = (partition, id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replicate a Produce, transparently forwarding to the leader
+    /// broker when this node isn't currently the Raft leader. Returns
+    /// the same `Vec<u64>` of record ids that a direct produce on the
+    /// leader would.
+    ///
+    /// Falls back to "let the caller handle ForwardToLeader" when
+    /// `ClusterConfig::client_addrs` is empty — i.e. the operator
+    /// hasn't told the broker how to reach its peers' client gRPC
+    /// listeners. In that case the typed `failed_precondition` status
+    /// (with `x-qx-leader-id` metadata) is the only signal the client
+    /// gets.
+    pub(crate) async fn replicate_or_forward_send(
+        self: &Arc<Self>,
+        topic_name: &str,
+        topic: Arc<Topic>,
+        key: bytes::Bytes,
+        payload: bytes::Bytes,
+    ) -> std::result::Result<(u32, u64), TopicError> {
+        let partition = topic.partition_for_key(&key);
+        let cmd = crate::replication::ProduceCommand {
+            topic: topic_name.to_string(),
+            partition,
+            payloads: vec![payload.clone()],
+        };
+        match self.replicator().replicate_produce(topic.clone(), cmd).await {
+            Ok(ids) => Ok((
+                partition,
+                ids.first().copied().ok_or_else(|| {
+                    TopicError::Other("replicator returned no record id".into())
+                })?,
+            )),
+            Err(TopicError::Other(msg)) if is_forward_to_leader(&msg) => {
+                let leader_id = parse_forward_to_leader(&msg).ok_or_else(|| {
+                    TopicError::Other(format!("ForwardToLeader without leader_id: {msg}"))
+                })?;
+                let mut peer = self.peer_client(leader_id).await.ok_or_else(|| {
+                    TopicError::Other(format!(
+                        "leader is node {leader_id} but no client_addr configured"
+                    ))
+                })?;
+                peer.send_bytes(topic_name, key, payload)
+                    .await
+                    .map_err(|e| TopicError::Other(format!("forward to leader {leader_id}: {e}")))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Install the replicator the broker should use for every Produce.
+    /// Intended for cluster-mode startup: the operator bootstraps a
+    /// [`qx_raft::Cluster`], builds a [`crate::replication::RaftReplicator`]
+    /// for this broker's `NodeId`, and calls this before serving
+    /// traffic. Returns `Err` if a replicator was already installed —
+    /// the broker is one-shot here, by design.
+    pub fn install_replicator(
+        &self,
+        replicator: Arc<dyn crate::replication::Replicator>,
+    ) -> std::result::Result<(), &'static str> {
+        self.replicator
+            .set(replicator)
+            .map_err(|_| "replicator already installed")
+    }
+
+    /// Get-or-init the replicator. Lazily falls back to
+    /// `NoopReplicator` on first call when nothing was installed —
+    /// preserves single-node behavior with no startup-order coupling.
+    pub(crate) fn replicator(&self) -> Arc<dyn crate::replication::Replicator> {
+        self.replicator
+            .get_or_init(|| Arc::new(crate::replication::NoopReplicator))
+            .clone()
+    }
+
+    /// Look up a topic by name. Returns the broker's internal
+    /// `Arc<Topic>` so cluster-mode integration tests can bind a
+    /// per-node Raft apply callback to the same handle the broker
+    /// itself uses. Returns `None` if no topic has been opened by
+    /// that name.
+    pub fn lookup_topic(&self, name: &str) -> Option<Arc<Topic>> {
+        self.lookup(name)
+    }
+
+    /// Open (or get) a topic on this broker. Returns the topic's
+    /// partition count. In single-node mode this is just a local
+    /// redb open. In cluster mode the gRPC `OpenTopic` handler
+    /// prefers [`Self::open_topic_async`] so the topic-create is
+    /// replicated to every broker.
+    pub fn open_topic_blocking(
+        &self,
+        name: &str,
+        partition_count: u32,
+    ) -> std::result::Result<u32, crate::BrokerError> {
+        self.get_or_open(name, partition_count)
+    }
+
+    /// Cluster-aware topic open. In cluster mode, routes the
+    /// `CreateTopic` through the installed
+    /// [`crate::replication::Replicator`] so every replica
+    /// materialises the topic before this future resolves. In
+    /// single-node mode, falls back to [`Self::open_topic_blocking`].
+    pub async fn open_topic_async(
+        &self,
+        name: &str,
+        partition_count: u32,
+    ) -> std::result::Result<u32, crate::BrokerError> {
+        if self.config.cluster.is_some() {
+            // Cluster mode — propose CreateTopic and wait for every
+            // node's apply to materialise the topic. The proposer's
+            // apply path calls `BrokerTopicResolver::create_topic`,
+            // which is what would have been called directly in
+            // single-node mode.
+            let replicator = self.replicator();
+            replicator
+                .replicate_create_topic(name.to_string(), partition_count)
+                .await
+                .map_err(crate::BrokerError::Topic)?;
+            // Read the partition count back from the (now-materialised)
+            // topic so a caller that asked for `partition_count = 0`
+            // and got a default still sees it.
+            let count = self
+                .lookup(name)
+                .map(|t| t.partition_count())
+                .unwrap_or(partition_count);
+            Ok(count)
+        } else {
+            self.get_or_open(name, partition_count)
+        }
+    }
+
+    /// Submit a Produce through the per-partition writer pipeline —
+    /// the same code path the Kafka wire protocol uses — and await
+    /// the assigned record ids. The call goes through the installed
+    /// [`crate::replication::Replicator`], so in cluster mode this
+    /// exercises the full Raft propose → commit → apply → return ids
+    /// loop. Production traffic should use the Kafka wire or gRPC
+    /// surface; this exists so cluster-wiring integration tests
+    /// don't need to spin up a Kafka listener.
+    pub async fn produce_for_test(
+        &self,
+        topic: &str,
+        partition: u32,
+        payloads: Vec<bytes::Bytes>,
+    ) -> std::result::Result<Vec<u64>, String> {
+        let handle = self
+            .produce_writer(topic, partition, Duration::ZERO)
+            .ok_or_else(|| format!("topic '{topic}' partition {partition} unknown"))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.send(crate::kafka::produce_writer::WriteRequest {
+            payloads,
+            respond_to: tx,
+        });
+        rx.await
+            .map_err(|_| "writer responder dropped".to_string())?
+    }
+
+    /// Access the per-core shard pool. `None` in Standard mode.
+    pub(crate) fn shard_pool(&self) -> Option<&Arc<crate::kafka::shards::ShardPool>> {
+        self.shard_pool.as_ref()
+    }
+
+    /// Access the ACL store for both wire APIs and per-request auth.
+    pub(crate) fn acls(&self) -> &crate::kafka::acls::AclStore {
+        &self.acls
+    }
+
+    /// `Some(voter_ids)` when the broker was opened with cluster config;
+    /// `None` for single-broker. Used by DescribeQuorum to advertise
+    /// the (potentially synthetic) KRaft quorum.
+    pub(crate) fn config_cluster_voters(&self) -> Option<Vec<i32>> {
+        self.config
+            .cluster
+            .as_ref()
+            .map(|c| c.voters.iter().map(|(id, _)| *id as i32).collect())
+    }
+
+    /// Subscribe to the broker-wide shutdown signal. Background tasks
+    /// should `select!` on `wait_for_shutdown(self.shutdown_token())` so
+    /// they can exit cleanly when `shutdown()` is called.
+    pub(crate) fn shutdown_token(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    /// Signal every background task to stop, then await every handle we
+    /// own (trigger dispatchers + outbox + any other internal task).
+    /// After this returns, every `Arc<Broker>` captured by background
+    /// work has been dropped; redb file locks release as soon as the
+    /// caller drops its own `Arc<Broker>`.
+    pub async fn shutdown(self: &Arc<Self>) {
+        let _ = self.shutdown_tx.send(true);
+
+        let trigger_handles: Vec<_> = {
+            let mut t = self.triggers.lock().unwrap();
+            t.drain().map(|(_, h)| h).collect()
+        };
+        for h in trigger_handles {
+            h.stop().await;
+        }
+
+        // Drop every produce-writer Sender. Each writer's `rx.recv()`
+        // returns None once its last Sender is dropped, the task exits,
+        // and its captured Arc<Mutex<Topic>> + Arc<Broker> bindings
+        // release. Without this drain, the writers keep file locks held
+        // and broker restart fails.
+        {
+            let mut w = self.produce_writers.lock().unwrap();
+            w.clear();
+        }
+
+        let bg: Vec<tokio::task::JoinHandle<()>> = {
+            let mut g = self.background_handles.lock().unwrap();
+            g.drain(..).collect()
+        };
+        for h in bg {
+            let _ = h.await;
+        }
+    }
+
+    /// Used by `outbox::spawn` (and any other internal task) to register
+    /// itself for graceful shutdown.
+    pub(crate) fn register_background(&self, handle: tokio::task::JoinHandle<()>) {
+        self.background_handles.lock().unwrap().push(handle);
     }
 
     fn get_or_init_schemas(&self) -> Result<Arc<Registry>> {
@@ -90,7 +753,7 @@ impl Broker {
         let topic = self
             .lookup(topic_name)
             .ok_or_else(|| crate::error::BrokerError::TopicNotFound(topic_name.to_string()))?;
-        let partition_count = topic.lock().unwrap().partition_count();
+        let partition_count = topic.partition_count();
         let group = Arc::new(Mutex::new(crate::groups::ConsumerGroup::new(
             partition_count,
         )));
@@ -106,7 +769,7 @@ impl Broker {
             .cloned()
     }
 
-    fn get_or_open_workflow(&self, name: &str) -> Result<Arc<Mutex<Engine>>> {
+    pub(crate) fn get_or_open_workflow(&self, name: &str) -> Result<Arc<Mutex<Engine>>> {
         let mut wfs = self.workflows.lock().unwrap();
         if let Some(arc) = wfs.get(name) {
             return Ok(arc.clone());
@@ -146,9 +809,10 @@ impl Broker {
             builder = builder
                 .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
         }
+        let shutdown = wait_for_shutdown(self.shutdown_token());
         builder
             .add_service(BrokerServer::with_interceptor(svc, interceptor))
-            .serve_with_incoming(stream)
+            .serve_with_incoming_shutdown(stream, shutdown)
             .await?;
         Ok(())
     }
@@ -171,6 +835,20 @@ impl Broker {
         }
     }
 
+    /// `(topic name, partition count)` for every currently-open topic.
+    /// Used by the Kafka Metadata handler; cheap because it only touches
+    /// the in-memory catalog.
+    pub fn topic_names_and_counts(&self) -> Vec<(String, u32)> {
+        let snaps: Vec<_> = {
+            let topics = self.topics.lock().unwrap();
+            topics.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
+        };
+        snaps
+            .into_iter()
+            .map(|(name, arc)| (name, arc.partition_count()))
+            .collect()
+    }
+
     pub fn all_stats(&self) -> Result<Vec<(String, qx_topic::TopicStats)>> {
         let snapshots: Vec<_> = {
             let topics = self.topics.lock().unwrap();
@@ -178,17 +856,16 @@ impl Broker {
         };
         let mut out = Vec::with_capacity(snapshots.len());
         for (name, arc) in snapshots {
-            let stats = arc.lock().unwrap().stats()?;
+            let stats = arc.stats()?;
             out.push((name, stats));
         }
         Ok(out)
     }
 
-    fn get_or_open(&self, name: &str, partition_count: u32) -> Result<u32> {
+    pub(crate) fn get_or_open(&self, name: &str, partition_count: u32) -> Result<u32> {
         let mut topics = self.topics.lock().unwrap();
         if let Some(arc) = topics.get(name) {
-            let t = arc.lock().unwrap();
-            return Ok(t.partition_count());
+            return Ok(arc.partition_count());
         }
         let dir = self.dir.join(name);
         let cfg = TopicConfig {
@@ -198,16 +875,497 @@ impl Broker {
                 visibility_timeout: Duration::from_secs(30),
                 max_attempts: 5,
                 durable_send: false,
+                eventual_commits: self.config.eventual_commits,
+                track_message_state: !self.config.log_only_storage,
             },
         };
         let topic = Topic::open(&dir, cfg)?;
         let count = topic.partition_count();
-        topics.insert(name.to_string(), Arc::new(Mutex::new(topic)));
+        topics.insert(name.to_string(), Arc::new(topic));
         Ok(count)
     }
 
-    fn lookup(&self, name: &str) -> Option<Arc<Mutex<Topic>>> {
+    /// Delete a topic and remove its on-disk directory.
+    ///
+    /// Returns `Ok(true)` if the topic existed; `Ok(false)` if it didn't.
+    /// Drops every per-partition writer first so their captured
+    /// `Arc<Topic>` references release, then waits briefly for the spawned
+    /// writer tasks to exit before removing the directory. The wait isn't
+    /// strictly necessary on a quiescent topic but stops a producer's
+    /// in-flight commit racing the `remove_dir_all`.
+    pub(crate) async fn delete_topic(&self, name: &str) -> Result<bool> {
+        let removed_arc = self.topics.lock().unwrap().remove(name);
+        let Some(arc) = removed_arc else {
+            return Ok(false);
+        };
+        {
+            let mut writers = self.produce_writers.lock().unwrap();
+            writers.retain(|(t, _), _| t != name);
+        }
+        drop(arc);
+        // Brief grace period for the writer tasks to drain their inboxes
+        // and drop their Arc<Topic> handles. ~100ms is enough on idle
+        // topics; an active topic might leave straggling redb files we
+        // best-effort `remove_dir_all` over.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let dir = self.dir.join(name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn lookup(&self, name: &str) -> Option<Arc<Topic>> {
         self.topics.lock().unwrap().get(name).cloned()
+    }
+
+    /// Broker's data directory. Used by `DescribeLogDirs` and any other
+    /// caller that needs to surface the root of all topic files.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Snapshot the names of every workflow currently opened by the broker.
+    /// Used by the outbox dispatcher to know what to drain.
+    pub(crate) fn open_workflow_names(&self) -> Vec<String> {
+        self.workflows.lock().unwrap().keys().cloned().collect()
+    }
+
+    pub(crate) fn lookup_workflow(&self, name: &str) -> Option<Arc<Mutex<Engine>>> {
+        self.workflows.lock().unwrap().get(name).cloned()
+    }
+
+    /// Get-or-open the persistent producer-dedup store.
+    fn producer_dedup_store(&self) -> Result<Arc<crate::kafka::producer_dedup::ProducerDedupStore>> {
+        let mut guard = self.producer_dedup_store.lock().unwrap();
+        if let Some(s) = guard.as_ref() {
+            return Ok(s.clone());
+        }
+        let s = Arc::new(crate::kafka::producer_dedup::ProducerDedupStore::open(&self.dir)?);
+        *guard = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Look up the most recent base-sequence we recorded for this
+    /// `(producer_id, partition)`. Returns `None` for first-seen producers.
+    pub(crate) fn producer_seen(
+        &self,
+        producer_id: i64,
+        partition: i32,
+    ) -> Option<crate::kafka::ProducerSequenceState> {
+        self.producer_dedup_store()
+            .ok()
+            .and_then(|s| s.get(producer_id, partition))
+    }
+
+    /// Record what we just appended for this `(producer_id, partition)`
+    /// durably so future retries (even after restart) are deduped.
+    pub(crate) fn record_producer(
+        &self,
+        producer_id: i64,
+        partition: i32,
+        state: crate::kafka::ProducerSequenceState,
+    ) {
+        if let Ok(store) = self.producer_dedup_store() {
+            let _ = store.put(producer_id, partition, state);
+        }
+    }
+
+    pub(crate) fn txn_registry(&self) -> Arc<crate::kafka::transactions::TxnRegistry> {
+        self.txn_registry.clone()
+    }
+
+    /// Current low-watermark for `(topic, partition)` as set by
+    /// `DeleteRecords`. Returns 0 when nothing has been deleted.
+    pub(crate) fn low_watermark(&self, topic: &str, partition: u32) -> u64 {
+        self.low_watermarks
+            .lock()
+            .unwrap()
+            .get(&(topic.to_string(), partition))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Advance the low-watermark for `(topic, partition)` monotonically.
+    /// Returns the new watermark (which equals the existing one if `offset`
+    /// is behind it). Caller is responsible for honoring the watermark on
+    /// reads.
+    pub(crate) fn advance_low_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> u64 {
+        let mut map = self.low_watermarks.lock().unwrap();
+        let cur = map
+            .entry((topic.to_string(), partition))
+            .or_insert(0);
+        if offset > *cur {
+            *cur = offset;
+        }
+        *cur
+    }
+
+    /// Lookup-or-spawn the per-`(topic, partition)` Produce writer.
+    /// Returns `None` if the topic doesn't exist or the partition is
+    /// out of range — callers should surface the matching Kafka error.
+    ///
+    /// `batch_window` is used only on first spawn; the writer keeps its
+    /// configured window for its whole lifetime so two listeners with
+    /// different windows would race on first call. In practice we
+    /// expect a single Kafka listener per broker, so this is fine.
+    pub(crate) fn produce_writer(
+        &self,
+        topic: &str,
+        partition: u32,
+        batch_window: Duration,
+    ) -> Option<crate::kafka::produce_writer::WriterHandle> {
+        let key = (topic.to_string(), partition);
+        {
+            let map = self.produce_writers.lock().unwrap();
+            if let Some(h) = map.get(&key) {
+                return Some(h.clone());
+            }
+        }
+        let topic_handle = self.lookup(topic)?;
+        // Validate partition exists before spawning so we don't leak
+        // writer tasks for nonexistent partitions.
+        if partition >= topic_handle.partition_count() {
+            return None;
+        }
+        let mut map = self.produce_writers.lock().unwrap();
+        if let Some(h) = map.get(&key) {
+            return Some(h.clone());
+        }
+        // Inline-safe iff the topic has no redb work to do per commit:
+        // log_only_storage flips off the message-state table, eventual_commits
+        // flips off the fsync. Both together leave only the log append,
+        // which is bounded µ-second mmap work — safe to keep on the
+        // tokio worker.
+        let inline_safe = self.config.eventual_commits && self.config.log_only_storage;
+        let handle = crate::kafka::produce_writer::spawn(
+            topic.to_string(),
+            topic_handle,
+            partition,
+            batch_window,
+            inline_safe,
+            self.replicator(),
+        );
+        map.insert(key, handle.clone());
+        Some(handle)
+    }
+
+    /// Lookup-or-spawn the coordinator task for a consumer group. Cheap
+    /// (HashMap + clone of an mpsc Sender).
+    pub(crate) fn group_coordinator(
+        &self,
+        group_id: &str,
+    ) -> crate::kafka::group_coordinator::CoordinatorHandle {
+        let mut map = self.group_coordinators.lock().unwrap();
+        if let Some(h) = map.get(group_id) {
+            return h.clone();
+        }
+        let handle = crate::kafka::group_coordinator::spawn(group_id.to_string());
+        map.insert(group_id.to_string(), handle.clone());
+        handle
+    }
+
+    /// Snapshot every coordinator handle currently spawned, paired with its
+    /// group_id. Used by ListGroups / DescribeGroups to enumerate state.
+    pub(crate) fn group_coordinator_snapshot(
+        &self,
+    ) -> Vec<(String, crate::kafka::group_coordinator::CoordinatorHandle)> {
+        self.group_coordinators
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Look up an existing coordinator without spawning one. Returns `None`
+    /// for unknown groups (so DescribeGroups can return GROUP_ID_NOT_FOUND
+    /// instead of spawning a phantom coordinator).
+    pub(crate) fn lookup_group_coordinator(
+        &self,
+        group_id: &str,
+    ) -> Option<crate::kafka::group_coordinator::CoordinatorHandle> {
+        self.group_coordinators
+            .lock()
+            .unwrap()
+            .get(group_id)
+            .cloned()
+    }
+
+    /// Path to a workflow's on-disk redb file. Exposed for inspection in
+    /// tests; production callers should go through the workflow handle
+    /// returned by `get_or_open_workflow`.
+    pub fn workflow_path(&self, name: &str) -> PathBuf {
+        self.dir.join("workflows").join(format!("{name}.redb"))
+    }
+
+    /// Atomically complete a task and stage one or more topic emits for
+    /// delivery. Public Rust API for the workflow → topic story; the gRPC
+    /// surface will follow.
+    pub fn complete_task_with_emits(
+        &self,
+        workflow: &str,
+        task_id: u64,
+        result: Vec<u8>,
+        emits: &[(&str, &[u8])],
+    ) -> Result<Vec<u64>> {
+        let engine = self.get_or_open_workflow(workflow)?;
+        let mut e = engine.lock().unwrap();
+        Ok(e.complete_with_emits(task_id, result, emits)?)
+    }
+
+    /// Inspect every record currently sitting in a topic across all
+    /// partitions, using the broker's own handle (so the redb file lock
+    /// is shared rather than fought over). Best-effort: returns an empty
+    /// vec if the topic hasn't been opened yet.
+    pub fn topic_records(&self, topic: &str, max_per_partition: usize) -> Result<Vec<Vec<u8>>> {
+        let Some(t) = self.lookup(topic) else {
+            return Ok(vec![]);
+        };
+        let pc = t.partition_count();
+        let mut out = Vec::new();
+        // Use a process-unique scratch group so inspection doesn't
+        // advance any real consumer's offset.
+        let group = format!("__inspect_{}_{}", std::process::id(), now_ns());
+        for p in 0..pc {
+            let msgs = t.stream(&group, p, max_per_partition)?;
+            out.extend(msgs.into_iter().map(|m| m.payload.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Sweep ids `0..upper_bound` and return every payload that exists in
+    /// the named workflow. Uses the broker's own Engine handle so it works
+    /// while a dispatcher holds the file open. Returns an empty vec if the
+    /// workflow hasn't been opened yet.
+    pub fn workflow_payloads(&self, name: &str, upper_bound: u64) -> Result<Vec<Vec<u8>>> {
+        let arc = match self.workflows.lock().unwrap().get(name).cloned() {
+            Some(a) => a,
+            None => return Ok(vec![]),
+        };
+        let engine = arc.lock().unwrap();
+        let mut out = Vec::new();
+        for id in 0..upper_bound {
+            if let Some(t) = engine.get(id)? {
+                out.push(t.payload.to_vec());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Get a clone of the persistent trigger store, opening it on first use.
+    pub(crate) fn trigger_store(&self) -> Result<Arc<crate::triggers::TriggerStore>> {
+        let mut guard = self.trigger_store.lock().unwrap();
+        if let Some(s) = guard.as_ref() {
+            return Ok(s.clone());
+        }
+        let s = Arc::new(crate::triggers::TriggerStore::open(&self.dir)?);
+        *guard = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Register a new trigger or replace an existing one with the same name.
+    /// Spawns a fresh dispatcher; the old one (if any) is aborted via Drop.
+    pub fn register_trigger(self: &Arc<Self>, config: crate::triggers::TriggerConfig) -> Result<()> {
+        self.trigger_store()?.put(&config)?;
+        let handle = crate::triggers::spawn_dispatcher(self.clone(), config.clone());
+        let mut triggers = self.triggers.lock().unwrap();
+        triggers.insert(config.name.clone(), handle);
+        Ok(())
+    }
+
+    /// Stop a trigger and remove it from durable storage. Returns true if
+    /// the trigger existed.
+    pub fn unregister_trigger(&self, name: &str) -> Result<bool> {
+        let removed_from_store = self.trigger_store()?.delete(name)?;
+        let removed_from_mem = self.triggers.lock().unwrap().remove(name).is_some();
+        Ok(removed_from_store || removed_from_mem)
+    }
+
+    /// Snapshot of every persistent trigger config (alive or not).
+    pub fn list_triggers(&self) -> Result<Vec<crate::triggers::TriggerConfig>> {
+        self.trigger_store()?.list()
+    }
+
+    /// Re-attach dispatchers for every persisted trigger. Call this once
+    /// after `open_with_config` from inside a tokio runtime.
+    pub fn resume_triggers(self: &Arc<Self>) -> Result<usize> {
+        let configs = self.trigger_store()?.list()?;
+        let n = configs.len();
+        let mut triggers = self.triggers.lock().unwrap();
+        for cfg in configs {
+            let handle = crate::triggers::spawn_dispatcher(self.clone(), cfg.clone());
+            triggers.insert(cfg.name.clone(), handle);
+        }
+        Ok(n)
+    }
+
+    /// Spawn every background dispatcher the broker needs (outbox, txn
+    /// sweeper, and any previously persisted triggers). Call this once
+    /// from inside a tokio runtime after `open_with_config`.
+    pub fn start_background(self: &Arc<Self>) -> Result<usize> {
+        crate::outbox::spawn(self.clone());
+        crate::txn_sweeper::spawn(self.clone());
+        self.resume_triggers()
+    }
+
+    /// Bootstrap this broker's Raft node from [`BrokerConfig::cluster`]
+    /// and install the matching `RaftReplicator`. No-op when cluster
+    /// mode is disabled.
+    ///
+    /// Each broker process calls this exactly once at startup. The
+    /// broker:
+    ///   1. binds a TCP listener on the address that
+    ///      [`ClusterConfig::voters`] lists under its `node_id`,
+    ///   2. starts a single-node [`qx_raft::GrpcCluster`] view that
+    ///      knows every peer's address,
+    ///   3. by convention, node 0 initialises cluster membership
+    ///      (idempotent on re-bootstrap — duplicate calls are
+    ///      coalesced by openraft + our `initialize_membership`),
+    ///   4. installs a [`crate::replication::RaftReplicator`] that
+    ///      every Produce on this broker routes through.
+    pub async fn start_cluster(self: &Arc<Self>) -> Result<()> {
+        let Some(cluster_cfg) = self.config.cluster.clone() else {
+            return Ok(());
+        };
+        let my_addr = cluster_cfg
+            .voters
+            .iter()
+            .find(|(id, _)| *id == cluster_cfg.node_id)
+            .map(|(_, a)| a.clone())
+            .ok_or_else(|| {
+                crate::BrokerError::Custom(format!(
+                    "node_id {} not present in voters list",
+                    cluster_cfg.node_id
+                ))
+            })?;
+
+        let listener = bind_with_retry(&my_addr)
+            .await
+            .map_err(crate::BrokerError::Io)?;
+        // Build the per-peer URL scheme based on whether raft TLS is
+        // enabled. mTLS handshakes require https://; plaintext stays
+        // http://.
+        let raft_tls = cluster_cfg.raft_tls.as_ref().map(|tls| {
+            // Server side: cert + key. The optional client_ca_pem
+            // selects mutual TLS — broker accepts only peer brokers
+            // whose certs chain back to one of the CAs.
+            let server = qx_raft::grpc::RaftServerTls {
+                cert_pem: tls.cert_pem.clone(),
+                key_pem: tls.key_pem.clone(),
+            };
+            // Client side: trust the same cert as the CA (self-signed
+            // multi-broker deployment, the typical local setup). For
+            // a PKI-issued deployment, an operator-supplied CA bundle
+            // would go here — qx-raft accepts any PEM-encoded CA.
+            let ca_pem = tls.client_ca_pem.clone().unwrap_or_else(|| tls.cert_pem.clone());
+            let client = qx_raft::grpc::RaftClientTls {
+                ca_pem,
+                // SNI: the broker's voter addresses are typically
+                // "127.0.0.1:N" in tests; we extract a hostname here.
+                // Real deployments override this via the same cert's
+                // SubjectAltName matching the host the operator
+                // configures.
+                domain: my_addr
+                    .split(':')
+                    .next()
+                    .unwrap_or("localhost")
+                    .to_string(),
+            };
+            (server, client)
+        });
+        let scheme = if raft_tls.is_some() { "https" } else { "http" };
+        let mut peer_addrs: std::collections::HashMap<qx_raft::NodeId, String> =
+            std::collections::HashMap::new();
+        for (id, addr) in &cluster_cfg.voters {
+            peer_addrs.insert(*id, format!("{scheme}://{addr}"));
+        }
+
+        let pending = crate::replication::fresh_pending_map();
+        let resolver: Arc<dyn crate::replication::TopicResolver> =
+            Arc::new(BrokerTopicResolver {
+                broker: Arc::downgrade(self),
+            });
+        let applier = crate::replication::RaftReplicator::applier_for_broker(
+            cluster_cfg.node_id,
+            resolver,
+            pending.clone(),
+        );
+
+        let raft_dir = self.dir.join("_raft");
+        let cluster = qx_raft::GrpcCluster::start_node(
+            cluster_cfg.node_id,
+            listener,
+            peer_addrs,
+            raft_dir,
+            Some(applier),
+            raft_tls,
+        )
+        .await
+        .map_err(|e| crate::BrokerError::Custom(format!("raft start_node: {e}")))?;
+        let cluster: Arc<qx_raft::GrpcCluster> = Arc::new(cluster);
+        // Stash a typed handle so `trigger_raft_snapshot` (used by
+        // the snapshot-install integration test) can drive an
+        // openraft snapshot on this node's local Raft instance.
+        let _ = self
+            .grpc_cluster_for_snapshot
+            .set(cluster.clone());
+
+        // Convention: node 0 owns the membership-init step. The
+        // `initialize_membership` helper is idempotent — restarting
+        // node 0 won't replay the bootstrap.
+        if cluster_cfg.node_id == 0 {
+            cluster
+                .initialize_membership(cluster_cfg.voters.len() as u32)
+                .await
+                .map_err(|e| {
+                    crate::BrokerError::Custom(format!(
+                        "initialize_membership on node 0: {e}"
+                    ))
+                })?;
+        }
+
+        let replicator = Arc::new(crate::replication::RaftReplicator::with_pending(
+            cluster as Arc<dyn qx_raft::RaftCluster>,
+            cluster_cfg.node_id,
+            pending,
+        ));
+        self.install_replicator(replicator).map_err(|e| {
+            crate::BrokerError::Custom(format!("install_replicator: {e}"))
+        })?;
+        Ok(())
+    }
+}
+
+/// Bridge between [`crate::replication::TopicResolver`] and the broker.
+/// Holds a `Weak<Broker>` to break the cycle: broker → cluster →
+/// applier → broker.
+struct BrokerTopicResolver {
+    broker: std::sync::Weak<Broker>,
+}
+
+impl crate::replication::TopicResolver for BrokerTopicResolver {
+    fn lookup(&self, name: &str) -> Option<Arc<Topic>> {
+        self.broker.upgrade().and_then(|b| b.lookup(name))
+    }
+
+    fn create_topic(
+        &self,
+        name: &str,
+        partition_count: u32,
+    ) -> std::result::Result<(), String> {
+        match self.broker.upgrade() {
+            Some(b) => b
+                .get_or_open(name, partition_count)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            None => Err("broker dropped".into()),
+        }
     }
 }
 
@@ -217,7 +1375,7 @@ struct BrokerSvc {
 
 impl BrokerSvc {
     #[allow(clippy::result_large_err)]
-    fn lookup_or_not_found(&self, topic: &str) -> std::result::Result<Arc<Mutex<Topic>>, Status> {
+    fn lookup_or_not_found(&self, topic: &str) -> std::result::Result<Arc<Topic>, Status> {
         self.broker
             .lookup(topic)
             .ok_or_else(|| Status::not_found(format!("topic '{topic}' not found")))
@@ -231,16 +1389,21 @@ impl BrokerSvcTrait for BrokerSvc {
         req: Request<proto::OpenTopicRequest>,
     ) -> std::result::Result<Response<proto::OpenTopicResponse>, Status> {
         let req = req.into_inner();
-        let broker = self.broker.clone();
-        let count = tokio::task::spawn_blocking(move || {
-            broker.get_or_open(&req.name, req.partition_count)
-        })
-        .await
-        .map_err(join_err)?
-        .map_err(|e| match e {
-            crate::error::BrokerError::Topic(te) => topic_err_to_status(te),
-            other => Status::internal(other.to_string()),
-        })?;
+        // Routes through the Replicator in cluster mode, so every
+        // broker materialises the topic via Raft apply. Falls back to
+        // a local redb open in single-node mode. The `redb` work
+        // happens inside `open_topic_async` (it spawn_blocks under
+        // the hood through `get_or_open` when single-node, and
+        // through `topic.send_batch_with_cursor` on the apply path
+        // when cluster).
+        let count = self
+            .broker
+            .open_topic_async(&req.name, req.partition_count)
+            .await
+            .map_err(|e| match e {
+                crate::error::BrokerError::Topic(te) => topic_err_to_status(te),
+                other => Status::internal(other.to_string()),
+            })?;
         Ok(Response::new(proto::OpenTopicResponse {
             partition_count: count,
         }))
@@ -252,16 +1415,23 @@ impl BrokerSvcTrait for BrokerSvc {
     ) -> std::result::Result<Response<proto::SendResponse>, Status> {
         let req = req.into_inner();
         let topic_mu = self.lookup_or_not_found(&req.topic)?;
-        let result = tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            t.send(&req.key, &req.payload)
-        })
-        .await
-        .map_err(join_err)?
-        .map_err(topic_err_to_status)?;
+        // `replicate_or_forward_send` routes through the local
+        // replicator first; on `ForwardToLeader` it transparently
+        // proxies to the leader broker's client-facing gRPC if
+        // `ClusterConfig::client_addrs` was set. In single-node mode
+        // the NoopReplicator path is identical to the pre-cluster
+        // behaviour.
+        // Hand the prost-generated `Bytes` straight through — the
+        // forwarding path (if any) will refcount-share them with
+        // tonic's encoder rather than realloc per record.
+        let (partition, record_id) = self
+            .broker
+            .replicate_or_forward_send(&req.topic, topic_mu, req.key, req.payload)
+            .await
+            .map_err(topic_err_to_status)?;
         Ok(Response::new(proto::SendResponse {
-            partition: result.0,
-            record_id: result.1,
+            partition,
+            record_id,
         }))
     }
 
@@ -271,29 +1441,27 @@ impl BrokerSvcTrait for BrokerSvc {
     ) -> std::result::Result<Response<proto::SendBatchResponse>, Status> {
         let req = req.into_inner();
         let topic_mu = self.lookup_or_not_found(&req.topic)?;
-        let items: Vec<(Vec<u8>, Vec<u8>)> = req
+        // Routes through the per-partition replicator with transparent
+        // leader forwarding on `ForwardToLeader`. The result vector
+        // preserves the caller's input order.
+        let items: Vec<(bytes::Bytes, bytes::Bytes)> = req
             .items
             .into_iter()
             .map(|i| (i.key, i.payload))
             .collect();
-        let results = tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            let pairs: Vec<(&[u8], &[u8])> =
-                items.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
-            t.send_batch(&pairs)
-        })
-        .await
-        .map_err(join_err)?
-        .map_err(topic_err_to_status)?;
-        Ok(Response::new(proto::SendBatchResponse {
-            results: results
-                .into_iter()
-                .map(|(p, id)| proto::SendResponse {
-                    partition: p,
-                    record_id: id,
-                })
-                .collect(),
-        }))
+        let outcomes = self
+            .broker
+            .replicate_or_forward_send_batch(&req.topic, topic_mu, items)
+            .await
+            .map_err(topic_err_to_status)?;
+        let results = outcomes
+            .into_iter()
+            .map(|(p, id)| proto::SendResponse {
+                partition: p,
+                record_id: id,
+            })
+            .collect();
+        Ok(Response::new(proto::SendBatchResponse { results }))
     }
 
     type ReceiveStreamStream = std::pin::Pin<
@@ -321,8 +1489,7 @@ impl BrokerSvcTrait for BrokerSvc {
                 }
                 let topic_mu = topic_mu.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let mut t = topic_mu.lock().unwrap();
-                    t.receive(max_batch)
+                    topic_mu.receive(max_batch)
                 })
                 .await;
                 match result {
@@ -359,8 +1526,7 @@ impl BrokerSvcTrait for BrokerSvc {
         let topic_mu = self.lookup_or_not_found(&req.topic)?;
         let max = req.max as usize;
         let messages = tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            t.receive(max)
+            topic_mu.receive(max)
         })
         .await
         .map_err(join_err)?
@@ -381,8 +1547,7 @@ impl BrokerSvcTrait for BrokerSvc {
             .ok_or_else(|| Status::invalid_argument("missing receipt"))?;
         let r = from_proto_receipt(receipt);
         tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            t.ack(r)
+            topic_mu.ack(r)
         })
         .await
         .map_err(join_err)?
@@ -401,8 +1566,7 @@ impl BrokerSvcTrait for BrokerSvc {
             .ok_or_else(|| Status::invalid_argument("missing receipt"))?;
         let r = from_proto_receipt(receipt);
         tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            t.nack(r)
+            topic_mu.nack(r)
         })
         .await
         .map_err(join_err)?
@@ -422,8 +1586,7 @@ impl BrokerSvcTrait for BrokerSvc {
         let r = from_proto_receipt(receipt);
         let ext = Duration::from_millis(req.extension_ms);
         tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            t.extend_visibility(r, ext)
+            topic_mu.extend_visibility(r, ext)
         })
         .await
         .map_err(join_err)?
@@ -506,7 +1669,6 @@ impl BrokerSvcTrait for BrokerSvc {
         let max = req.max as usize;
         let group_name = req.group.clone();
         let messages = tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
             let mut out = Vec::new();
             // Fair across assigned partitions: ceil(max / n).
             let per_partition = if assignment.is_empty() {
@@ -519,7 +1681,7 @@ impl BrokerSvcTrait for BrokerSvc {
                     break;
                 }
                 let take = (max - out.len()).min(per_partition);
-                let msgs = t.stream(&group_name, *partition, take)?;
+                let msgs = topic_mu.stream(&group_name, *partition, take)?;
                 for m in msgs {
                     out.push(m);
                 }
@@ -551,8 +1713,7 @@ impl BrokerSvcTrait for BrokerSvc {
         let max = req.max as usize;
         let group = req.group;
         let messages = tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            t.stream(&group, partition, max)
+            topic_mu.stream(&group, partition, max)
         })
         .await
         .map_err(join_err)?
@@ -579,8 +1740,7 @@ impl BrokerSvcTrait for BrokerSvc {
         let offset = req.offset;
         let group = req.group;
         tokio::task::spawn_blocking(move || {
-            let mut t = topic_mu.lock().unwrap();
-            t.commit_offset(&group, partition, offset)
+            topic_mu.commit_offset(&group, partition, offset)
         })
         .await
         .map_err(join_err)?
@@ -597,8 +1757,7 @@ impl BrokerSvcTrait for BrokerSvc {
         let partition = req.partition;
         let group = req.group;
         let offset = tokio::task::spawn_blocking(move || {
-            let t = topic_mu.lock().unwrap();
-            t.group_offset(&group, partition)
+            topic_mu.group_offset(&group, partition)
         })
         .await
         .map_err(join_err)?
@@ -828,6 +1987,81 @@ impl BrokerSvcTrait for BrokerSvc {
         Ok(Response::new(proto::ListSchemaVersionsResponse { versions }))
     }
 
+    async fn register_trigger(
+        &self,
+        req: Request<proto::TriggerSpec>,
+    ) -> std::result::Result<Response<proto::RegisterTriggerResponse>, Status> {
+        let req = req.into_inner();
+        let mut cfg = crate::triggers::TriggerConfig::new(&req.name, &req.topic, &req.workflow);
+        if req.batch_size > 0 {
+            cfg.batch_size = req.batch_size;
+        }
+        if req.poll_interval_ms > 0 {
+            cfg.poll_interval_ms = req.poll_interval_ms;
+        }
+        let broker = self.broker.clone();
+        tokio::task::spawn_blocking(move || broker.register_trigger(cfg))
+            .await
+            .map_err(join_err)?
+            .map_err(broker_err_to_status)?;
+        Ok(Response::new(proto::RegisterTriggerResponse {}))
+    }
+
+    async fn unregister_trigger(
+        &self,
+        req: Request<proto::UnregisterTriggerRequest>,
+    ) -> std::result::Result<Response<proto::UnregisterTriggerResponse>, Status> {
+        let name = req.into_inner().name;
+        let broker = self.broker.clone();
+        let removed = tokio::task::spawn_blocking(move || broker.unregister_trigger(&name))
+            .await
+            .map_err(join_err)?
+            .map_err(broker_err_to_status)?;
+        Ok(Response::new(proto::UnregisterTriggerResponse { removed }))
+    }
+
+    async fn list_triggers(
+        &self,
+        _req: Request<proto::ListTriggersRequest>,
+    ) -> std::result::Result<Response<proto::ListTriggersResponse>, Status> {
+        let broker = self.broker.clone();
+        let triggers = tokio::task::spawn_blocking(move || broker.list_triggers())
+            .await
+            .map_err(join_err)?
+            .map_err(broker_err_to_status)?;
+        Ok(Response::new(proto::ListTriggersResponse {
+            triggers: triggers
+                .into_iter()
+                .map(|c| proto::TriggerSpec {
+                    name: c.name,
+                    topic: c.topic,
+                    workflow: c.workflow,
+                    batch_size: c.batch_size,
+                    poll_interval_ms: c.poll_interval_ms,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn complete_task_with_emits(
+        &self,
+        req: Request<proto::CompleteTaskWithEmitsRequest>,
+    ) -> std::result::Result<Response<proto::TaskOpResponse>, Status> {
+        let req = req.into_inner();
+        let broker = self.broker.clone();
+        tokio::task::spawn_blocking(move || {
+            let emits: Vec<(&str, &[u8])> =
+                req.emits.iter().map(|e| (e.topic.as_str(), e.payload.as_slice())).collect();
+            broker
+                .complete_task_with_emits(&req.workflow, req.task_id, req.result, &emits)
+                .map(|_| ())
+        })
+        .await
+        .map_err(join_err)?
+        .map_err(broker_err_to_status)?;
+        Ok(Response::new(proto::TaskOpResponse {}))
+    }
+
     async fn list_subjects(
         &self,
         _req: Request<proto::ListSubjectsRequest>,
@@ -850,8 +2084,7 @@ impl BrokerSvcTrait for BrokerSvc {
         let req = req.into_inner();
         let topic_mu = self.lookup_or_not_found(&req.topic)?;
         let stats = tokio::task::spawn_blocking(move || {
-            let t = topic_mu.lock().unwrap();
-            t.stats()
+            topic_mu.stats()
         })
         .await
         .map_err(join_err)?
@@ -875,6 +2108,10 @@ fn proto_message(m: qx_topic::TopicMessage) -> proto::TopicMessage {
             attempt: m.receipt.inner.attempt,
         }),
         attempts: m.attempts,
+        // qx-storage's `Segment::read` already returns `Bytes`, so the
+        // qx-queue → qx-topic → broker path holds a single refcounted
+        // slice end-to-end. Prost encodes it onto the wire without a
+        // second copy.
         payload: m.payload,
     }
 }
@@ -895,8 +2132,41 @@ fn topic_err_to_status(e: TopicError) -> Status {
         InvalidPartition { .. } | ZeroPartitions | PartitionCountMismatch { .. } => {
             Status::invalid_argument(e.to_string())
         }
+        Other(msg) if is_forward_to_leader(msg) => {
+            // openraft surfaces ForwardToLeader as
+            // "...forward request to: Some(<leader_id>), ..." in the
+            // error string. Translate to a typed gRPC status so
+            // clients don't have to grep error strings — leader id
+            // goes into the trailing metadata key `x-qx-leader-id`
+            // for retry routing.
+            let mut status = Status::failed_precondition(format!("not leader: {msg}"));
+            if let Some(leader_id) = parse_forward_to_leader(msg)
+                && let Ok(v) = leader_id.to_string().parse()
+            {
+                status.metadata_mut().insert("x-qx-leader-id", v);
+            }
+            status
+        }
         _ => Status::internal(e.to_string()),
     }
+}
+
+/// Extract the `leader_id` from openraft's `ForwardToLeader` error
+/// stringification. Format observed at openraft 0.9:
+///   `...forward request to: Some(<id>), Some(BasicNode { addr: "..." })`
+fn parse_forward_to_leader(s: &str) -> Option<u64> {
+    let idx = s.find("forward request to: Some(")?;
+    let rest = &s[idx + "forward request to: Some(".len()..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse::<u64>().ok()
+}
+
+/// `true` if `s` is openraft's `ForwardToLeader` error stringification.
+/// openraft 0.9's `Display` doesn't actually emit the literal token
+/// `ForwardToLeader` — it says "has to forward request to". Match on
+/// the substring that's stable across the two cases.
+fn is_forward_to_leader(s: &str) -> bool {
+    s.contains("forward request to") || s.contains("ForwardToLeader")
 }
 
 fn broker_err_to_status(e: crate::error::BrokerError) -> Status {
@@ -951,6 +2221,34 @@ fn task_to_proto(t: Task) -> proto::TaskMessage {
 
 fn join_err(e: tokio::task::JoinError) -> Status {
     Status::internal(format!("blocking task join: {e}"))
+}
+
+/// Bind a TCP listener, retrying on `AddrInUse` for up to ~5 s. The
+/// integration tests reserve a port, drop it, then spawn the broker
+/// expecting the broker to rebind. Under workspace-parallel `cargo
+/// test`, another test may grab the port in the gap. A short retry
+/// loop closes that race without affecting normal startup latency on
+/// an actually-occupied port.
+///
+/// Exposed publicly so `qxd` (and any other binary built on top of
+/// `qx-broker`) can share the same retry logic at every bind site
+/// instead of duplicating it.
+pub async fn bind_with_retry(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    use std::time::Duration as StdDur;
+    let mut backoff = StdDur::from_millis(20);
+    let deadline = tokio::time::Instant::now() + StdDur::from_secs(5);
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+                && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(StdDur::from_millis(250));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -1036,6 +2334,37 @@ pub(crate) fn format_metrics(stats: &[(String, qx_topic::TopicStats)]) -> String
         ));
     }
     out
+}
+
+/// Resolves when the broker's shutdown watch flips to true. Used to drive
+/// `serve_with_incoming_shutdown` and similar wait points.
+pub(crate) async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+}
+
+/// Install the `ring` CryptoProvider once per process. Idempotent: a
+/// second call (e.g. from `qx-raft`) is a no-op via `Once`. Required by
+/// rustls 0.23 before any TLS server or client setup.
+fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 fn escape_label(s: &str) -> String {

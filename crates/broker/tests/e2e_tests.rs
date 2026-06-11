@@ -40,7 +40,7 @@ async fn send_then_receive_over_grpc() {
     let (partition, _id) = client.send("t", b"key", b"hello").await.unwrap();
     let batch = client.receive("t", 10).await.unwrap();
     assert_eq!(batch.len(), 1);
-    assert_eq!(batch[0].payload, b"hello");
+    assert_eq!(&batch[0].payload[..], b"hello");
     assert_eq!(batch[0].partition, partition);
 }
 
@@ -80,9 +80,18 @@ async fn send_batch_over_grpc() {
     let mut client = Client::connect(url).await.unwrap();
     client.open_topic("t", 4).await.unwrap();
     let items = vec![
-        (b"k1".to_vec(), b"v1".to_vec()),
-        (b"k2".to_vec(), b"v2".to_vec()),
-        (b"k3".to_vec(), b"v3".to_vec()),
+        (
+            bytes::Bytes::from_static(b"k1"),
+            bytes::Bytes::from_static(b"v1"),
+        ),
+        (
+            bytes::Bytes::from_static(b"k2"),
+            bytes::Bytes::from_static(b"v2"),
+        ),
+        (
+            bytes::Bytes::from_static(b"k3"),
+            bytes::Bytes::from_static(b"v3"),
+        ),
     ];
     let results = client.send_batch("t", items).await.unwrap();
     assert_eq!(results.len(), 3);
@@ -239,7 +248,7 @@ async fn workflow_create_root_and_get_returns_pending_task() {
     let task = client.get_task("deploy", id).await.unwrap();
     assert_eq!(task.id, id);
     assert_eq!(task.status, 0); // Pending
-    assert_eq!(task.payload, b"plan");
+    assert_eq!(&task.payload[..], b"plan");
     assert!(task.parent_id.is_none());
 }
 
@@ -277,7 +286,7 @@ async fn workflow_complete_and_fail_transition_status() {
     let ta = client.get_task("wf", a).await.unwrap();
     let tb = client.get_task("wf", b).await.unwrap();
     assert_eq!(ta.status, 2); // Done
-    assert_eq!(ta.result, b"ok");
+    assert_eq!(&ta.result[..], b"ok");
     assert_eq!(tb.status, 3); // Failed
     assert_eq!(tb.error, "boom");
 }
@@ -329,6 +338,7 @@ async fn start_server_with_tls() -> (TempDir, Arc<Broker>, String, Vec<u8>) {
             tls: Some(TlsConfig {
                 cert_pem: cert_pem.clone().into_bytes(),
                 key_pem: key_pem.into_bytes(),
+                client_ca_pem: None,
             }),
             ..Default::default()
         },

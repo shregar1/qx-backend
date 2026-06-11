@@ -9,11 +9,30 @@ description = "Durable append-only log storage for QX"
 [dependencies]
 thiserror.workspace = true
 crc32fast.workspace = true
+bytes.workspace = true
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile.workspace = true
 criterion.workspace = true
 
+# io_uring is Linux-only — gated below by target_os = "linux". The
+# `io-uring` crate is a thin safe wrapper over the kernel ABI; chosen
+# over `tokio-uring`/`monoio` so the benchmark doesn't drag in a whole
+# async runtime alongside the existing sync code.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+io-uring = "0.6"
+libc = "0.2"
+
 [[bench]]
 name = "storage_bench"
 harness = false
+
+# The io-backend benchmark is a plain `[[example]]` rather than a
+# criterion bench because the io_uring path is Linux-only and we want
+# to run it as `cargo run --release --example io_backends` inside a
+# Linux container without dragging in criterion's flakier wall-clock
+# measurement loop. The example prints throughput / latency directly.
+[[example]]
+name = "io_backends"
+path = "examples/io_backends.rs"

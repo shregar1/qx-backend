@@ -25,6 +25,9 @@ pub enum BrokerError {
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error("{0}")]
+    Custom(String),
 }
 
 impl From<tonic::transport::Error> for BrokerError {

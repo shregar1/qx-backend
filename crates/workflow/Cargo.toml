@@ -9,6 +9,7 @@ description = "Task DAG (parent/child workflow primitives) over redb"
 [dependencies]
 redb.workspace = true
 thiserror.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

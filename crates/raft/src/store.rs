@@ -51,7 +51,20 @@ struct Inner {
 
 /// Side-channel callback invoked on each committed `EntryPayload::Normal`.
 /// Used to drive external state (e.g. a replicated `qx_topic::Topic`).
-pub type ApplyCallback = Arc<dyn Fn(&[u8]) + Send + Sync>;
+///
+/// The `u64` is the Raft log index of the entry. Brokers use it as a
+/// monotonic apply cursor stored alongside the external state so a
+/// crash between the callback running and the Raft commit landing on
+/// disk doesn't cause a re-apply on restart (the cursor in the external
+/// state survived, the callback sees `index <= cursor`, skips). For
+/// in-memory state machines (e.g. `ReplicatedTopic` which loses its
+/// log on restart and rebuilds from `replay_to_callback`) the index is
+/// informational only.
+///
+/// During `replay_to_callback` the index is the position in the
+/// persisted state-machine log (1-based) — a synthetic but
+/// monotonically increasing value.
+pub type ApplyCallback = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct MemoryStorage {
@@ -247,7 +260,7 @@ impl RaftStorage<TypeConfig> for MemoryStorage {
                     let index = inner.state_machine.log.len() as u64 - 1;
                     responses.push(AppResponse { index });
                     if let Some(cb) = &self.apply_callback {
-                        cb(&req.payload);
+                        cb(entry.log_id.index, &req.payload);
                     }
                 }
                 EntryPayload::Membership(m) => {

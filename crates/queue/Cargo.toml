@@ -10,6 +10,7 @@ description = "Queue semantics (visibility, ack/nack, DLQ) layered over qx-stora
 qx-storage = { path = "../storage" }
 redb.workspace = true
 thiserror.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -19,6 +19,13 @@ pub enum TopicError {
 
     #[error("partition_count must be at least 1")]
     ZeroPartitions,
+
+    /// Catch-all for errors that don't fit the strongly-typed variants
+    /// — primarily used by the replication seam to surface failures
+    /// from Raft (serialization, leader timeout, channel closed) up to
+    /// the broker's Produce handler.
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, TopicError>;

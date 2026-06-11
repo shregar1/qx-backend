@@ -16,6 +16,8 @@ fn config(partitions: u32) -> TopicConfig {
             visibility_timeout: Duration::from_secs(30),
             max_attempts: 5,
             durable_send: false,
+            eventual_commits: false,
+            track_message_state: true,
         },
     }
 }
@@ -75,7 +77,10 @@ fn send_then_receive_round_trip() {
     let mut topic = Topic::open(tmp.path(), config(4)).unwrap();
     let (partition, id) = topic.send(b"key", b"hello").unwrap();
     let batch = topic.receive(10).unwrap();
-    let msg = batch.iter().find(|m| m.payload == b"hello").expect("found");
+    let msg = batch
+        .iter()
+        .find(|m| m.payload.as_ref() == b"hello")
+        .expect("found");
     assert_eq!(msg.partition, partition);
     assert_eq!(msg.id, id);
 }
@@ -86,7 +91,10 @@ fn send_to_specific_partition_works() {
     let mut topic = Topic::open(tmp.path(), config(4)).unwrap();
     topic.send_to(2, b"forced").unwrap();
     let batch = topic.receive(10).unwrap();
-    let msg = batch.iter().find(|m| m.payload == b"forced").unwrap();
+    let msg = batch
+        .iter()
+        .find(|m| m.payload.as_ref() == b"forced")
+        .unwrap();
     assert_eq!(msg.partition, 2);
 }
 
@@ -124,7 +132,7 @@ fn receive_from_specific_partition() {
     topic.send_to(2, b"c").unwrap();
     let batch = topic.receive_from(1, 10).unwrap();
     assert_eq!(batch.len(), 1);
-    assert_eq!(batch[0].payload, b"b");
+    assert_eq!(&(batch[0].payload)[..], b"b");
     assert_eq!(batch[0].partition, 1);
 }
 

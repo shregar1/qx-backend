@@ -14,6 +14,8 @@ fn config(visibility: Duration, max_attempts: u32) -> QueueConfig {
         visibility_timeout: visibility,
         max_attempts,
         durable_send: false, // tests run fast
+        eventual_commits: false,
+        track_message_state: true,
     }
 }
 
@@ -26,7 +28,7 @@ fn send_then_receive_returns_message() {
     let batch = q.receive(10).unwrap();
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, id);
-    assert_eq!(batch[0].payload, b"hello");
+    assert_eq!(&(batch[0].payload)[..], b"hello");
     assert_eq!(batch[0].attempts, 1);
 }
 
@@ -237,7 +239,7 @@ fn stream_returns_messages_from_start_when_no_offset() {
         q.send(format!("m{i}").as_bytes()).unwrap();
     }
     let msgs = q.stream("g", 10).unwrap();
-    let payloads: Vec<_> = msgs.iter().map(|m| m.payload.clone()).collect();
+    let payloads: Vec<_> = msgs.iter().map(|m| m.payload.to_vec()).collect();
     assert_eq!(
         payloads,
         vec![b"m0".to_vec(), b"m1".to_vec(), b"m2".to_vec()]
@@ -269,7 +271,7 @@ fn commit_offset_advances_stream_starting_point() {
     q.commit_offset("g", last_id + 1).unwrap();
 
     let next = q.stream("g", 10).unwrap();
-    let payloads: Vec<_> = next.iter().map(|m| m.payload.clone()).collect();
+    let payloads: Vec<_> = next.iter().map(|m| m.payload.to_vec()).collect();
     assert_eq!(payloads, vec![b"m2".to_vec(), b"m3".to_vec(), b"m4".to_vec()]);
 }
 
@@ -297,7 +299,7 @@ fn send_keyed_persists_compaction_key() {
     let batch = q.receive(10).unwrap();
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, id);
-    assert_eq!(batch[0].payload, b"v1");
+    assert_eq!(&(batch[0].payload)[..], b"v1");
 }
 
 #[test]
@@ -314,7 +316,7 @@ fn compact_by_key_keeps_only_latest_per_key() {
 
     let batch = q.receive(10).unwrap();
     let payloads: std::collections::HashSet<_> =
-        batch.iter().map(|m| m.payload.clone()).collect();
+        batch.iter().map(|m| m.payload.to_vec()).collect();
     assert_eq!(batch.len(), 2);
     assert!(payloads.contains(b"v3".as_slice()));
     assert!(payloads.contains(b"only".as_slice()));
@@ -369,6 +371,8 @@ fn compact_after_acking_all_messages_drops_sealed_segments() {
         visibility_timeout: Duration::from_secs(30),
         max_attempts: 5,
         durable_send: false,
+        eventual_commits: false,
+        track_message_state: true,
     };
     let mut q = Queue::open(tmp.path(), small).unwrap();
     for _ in 0..6 {
@@ -418,7 +422,7 @@ fn send_with_dedup_same_key_returns_existing_id() {
     // Only one message in the queue, not two
     let batch = q.receive(10).unwrap();
     assert_eq!(batch.len(), 1);
-    assert_eq!(batch[0].payload, b"first");
+    assert_eq!(&(batch[0].payload)[..], b"first");
 }
 
 #[test]
@@ -469,8 +473,148 @@ fn send_batch_returns_ids_and_messages_are_receivable() {
 
     let batch = q.receive(10).unwrap();
     assert_eq!(batch.len(), 3);
-    let payloads_received: Vec<_> = batch.iter().map(|m| m.payload.as_slice()).collect();
+    let payloads_received: Vec<_> = batch.iter().map(|m| m.payload.as_ref()).collect();
     assert_eq!(payloads_received, vec![&b"one"[..], &b"two"[..], &b"three"[..]]);
+}
+
+#[test]
+fn send_batch_with_cursor_blocks_duplicate_apply() {
+    // The applier replicates a Raft entry by calling
+    // `send_batch_with_cursor(payloads, raft_index)`. A second call
+    // with the same `raft_index` (or any lower index) is what
+    // openraft's crash-recovery path triggers — that call must
+    // return `Ok(None)` and not touch on-disk state.
+    let tmp = tempdir().unwrap();
+    let mut q = Queue::open(tmp.path(), config(Duration::from_secs(30), 5)).unwrap();
+
+    let first = q.send_batch_with_cursor(&[b"a", b"b", b"c"], 5).unwrap();
+    assert_eq!(first, Some(vec![0u64, 1, 2]));
+
+    // Same raft_index → duplicate, must be a no-op.
+    let dup = q.send_batch_with_cursor(&[b"a", b"b", b"c"], 5).unwrap();
+    assert_eq!(dup, None);
+
+    // Lower raft_index than persisted cursor → also a no-op.
+    let stale = q.send_batch_with_cursor(&[b"x"], 4).unwrap();
+    assert_eq!(stale, None);
+
+    // Strictly higher raft_index → applies and advances the cursor.
+    let fresh = q.send_batch_with_cursor(&[b"d"], 6).unwrap();
+    assert_eq!(fresh, Some(vec![3u64]));
+
+    // Verify nothing slipped through: the queue should hold exactly
+    // the four records we just appended.
+    let batch = q.receive(10).unwrap();
+    assert_eq!(batch.len(), 4);
+    assert_eq!(&(batch[0].payload)[..], b"a");
+    assert_eq!(&(batch[3].payload)[..], b"d");
+}
+
+#[test]
+fn send_batch_with_cursor_persists_cursor_across_reopen() {
+    // The cursor lives in redb alongside the range table. After
+    // reopen, the cursor must still gate duplicate applies.
+    let tmp = tempdir().unwrap();
+    let cfg = config(Duration::from_secs(30), 5);
+    {
+        let mut q = Queue::open(tmp.path(), cfg.clone()).unwrap();
+        let ids = q.send_batch_with_cursor(&[b"one"], 10).unwrap();
+        assert_eq!(ids, Some(vec![0u64]));
+    }
+    let mut q = Queue::open(tmp.path(), cfg).unwrap();
+    // Replay of raft_index 10 after reopen must still be a no-op.
+    let dup = q.send_batch_with_cursor(&[b"one"], 10).unwrap();
+    assert_eq!(dup, None);
+    let fresh = q.send_batch_with_cursor(&[b"two"], 11).unwrap();
+    assert_eq!(fresh, Some(vec![1u64]));
+}
+
+#[test]
+fn ack_batch_drops_all_receipts_in_one_commit() {
+    let tmp = tempdir().unwrap();
+    let mut q = Queue::open(tmp.path(), config(Duration::from_secs(30), 5)).unwrap();
+    let payloads: Vec<Vec<u8>> = (0..50).map(|i| format!("m{i}").into_bytes()).collect();
+    let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+    q.send_batch(&refs).unwrap();
+    let batch = q.receive(50).unwrap();
+    assert_eq!(batch.len(), 50);
+    let receipts: Vec<_> = batch.into_iter().map(|m| m.receipt).collect();
+    q.ack_batch(&receipts).unwrap();
+    let stats = q.stats().unwrap();
+    assert_eq!(stats.pending, 0);
+    assert_eq!(stats.inflight, 0);
+}
+
+#[test]
+fn ack_batch_with_stale_receipt_aborts_whole_batch() {
+    let tmp = tempdir().unwrap();
+    let mut q = Queue::open(tmp.path(), config(Duration::from_secs(30), 5)).unwrap();
+    q.send_batch(&[b"a", b"b"]).unwrap();
+    let batch = q.receive(2).unwrap();
+    let good = batch[0].receipt;
+    let mut stale = batch[1].receipt;
+    stale.attempt = 999; // fake a stale receipt
+    let err = q.ack_batch(&[good, stale]).unwrap_err();
+    assert!(matches!(err, qx_queue::QueueError::StaleReceipt));
+    // Neither offset should be acked — the txn rolled back.
+    let stats = q.stats().unwrap();
+    assert_eq!(stats.inflight, 2);
+}
+
+#[test]
+fn ack_in_middle_of_inflight_range_splits_correctly() {
+    let tmp = tempdir().unwrap();
+    let mut q = Queue::open(tmp.path(), config(Duration::from_secs(30), 5)).unwrap();
+    q.send_batch(&[b"a", b"b", b"c", b"d", b"e"]).unwrap();
+    let batch = q.receive(5).unwrap();
+    // Ack the middle one — this exercises range-split on InFlight.
+    let middle = batch[2].receipt;
+    q.ack(middle).unwrap();
+    // Remaining 4 are still InFlight.
+    let stats = q.stats().unwrap();
+    assert_eq!(stats.inflight, 4);
+    // Acking the rest in scattered order still works.
+    q.ack(batch[0].receipt).unwrap();
+    q.ack(batch[4].receipt).unwrap();
+    q.ack(batch[1].receipt).unwrap();
+    q.ack(batch[3].receipt).unwrap();
+    let stats = q.stats().unwrap();
+    assert_eq!(stats.pending + stats.inflight + stats.dead, 0);
+}
+
+#[test]
+fn many_single_sends_collapse_into_one_range_row() {
+    // Sanity check the range-merge invariant: 1000 single sends should
+    // collapse to one redb row internally. We can't assert the row
+    // count directly from the public API, but receive() must still
+    // deliver them in FIFO order and stats must show the correct
+    // pending count.
+    let tmp = tempdir().unwrap();
+    let mut q = Queue::open(tmp.path(), config(Duration::from_secs(30), 5)).unwrap();
+    for i in 0..1000u32 {
+        q.send(format!("m{i}").as_bytes()).unwrap();
+    }
+    assert_eq!(q.stats().unwrap().pending, 1000);
+    let batch = q.receive(1000).unwrap();
+    assert_eq!(batch.len(), 1000);
+    for (i, m) in batch.iter().enumerate() {
+        assert_eq!(m.id, i as u64);
+    }
+}
+
+#[test]
+fn nack_middle_of_inflight_range_only_returns_that_offset() {
+    let tmp = tempdir().unwrap();
+    let mut q = Queue::open(tmp.path(), config(Duration::from_secs(30), 5)).unwrap();
+    q.send_batch(&[b"a", b"b", b"c", b"d", b"e"]).unwrap();
+    let batch = q.receive(5).unwrap();
+    let middle = batch[2].receipt;
+    q.nack(middle).unwrap();
+    // The single nacked message should reappear; the other 4 stay InFlight.
+    let again = q.receive(5).unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].id, batch[2].id);
+    assert_eq!(again[0].attempts, 2);
 }
 
 #[test]
@@ -497,5 +641,5 @@ fn reopen_recovers_orphaned_log_records_as_pending() {
     let mut q = Queue::open(tmp.path(), cfg).unwrap();
     let batch = q.receive(10).unwrap();
     assert_eq!(batch.len(), 2);
-    assert_eq!(batch[1].payload, b"phantom");
+    assert_eq!(&(batch[1].payload)[..], b"phantom");
 }

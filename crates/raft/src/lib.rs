@@ -13,11 +13,14 @@ mod network;
 mod persistent_store;
 mod replicated_topic;
 mod store;
+mod traits;
 mod types;
 
 pub use cluster::{Cluster, GrpcCluster, PersistentCluster};
+pub use traits::RaftCluster;
 pub use grpc::{RaftClientTls, RaftServerTls};
 pub use error::{RaftError, Result};
 pub use persistent_store::PersistentStorage;
 pub use replicated_topic::{IsolationLevel, PersistentReplicatedTopic, ReplicatedTopic};
+pub use store::ApplyCallback;
 pub use types::{AppRequest, AppResponse, NodeId, TypeConfig};

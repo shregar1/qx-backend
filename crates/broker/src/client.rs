@@ -20,7 +20,11 @@ pub struct ReceivedMessage {
     pub id: u64,
     pub receipt: proto::Receipt,
     pub attempts: u32,
-    pub payload: Vec<u8>,
+    /// Refcounted slice into the gRPC frame. The bytes are the same
+    /// `bytes::Bytes` prost decoded from the wire — no per-record
+    /// allocation on the client receive path. Compare bytes with
+    /// `.as_ref()` or `&payload[..]` when you don't need ownership.
+    pub payload: bytes::Bytes,
 }
 
 impl Client {
@@ -100,8 +104,30 @@ impl Client {
             .inner
             .send(self.auth(proto::SendRequest {
                 topic: topic.to_string(),
-                key: key.to_vec(),
-                payload: payload.to_vec(),
+                key: bytes::Bytes::copy_from_slice(key),
+                payload: bytes::Bytes::copy_from_slice(payload),
+            }))
+            .await?;
+        let r = resp.into_inner();
+        Ok((r.partition, r.record_id))
+    }
+
+    /// Send refcounted `Bytes` directly — no `copy_from_slice` step.
+    /// Use this when the caller already owns the payload as `Bytes`
+    /// (forwarding paths, batch decoders, etc). Otherwise prefer
+    /// [`Self::send`] which accepts `&[u8]` ergonomically.
+    pub async fn send_bytes(
+        &mut self,
+        topic: &str,
+        key: bytes::Bytes,
+        payload: bytes::Bytes,
+    ) -> Result<(u32, u64)> {
+        let resp = self
+            .inner
+            .send(self.auth(proto::SendRequest {
+                topic: topic.to_string(),
+                key,
+                payload,
             }))
             .await?;
         let r = resp.into_inner();
@@ -119,21 +145,45 @@ impl Client {
         // checking the response — for tests we just send with the partition id
         // as the key, which is good enough for the round-trip even if the hash
         // disagrees. Returns the record id, ignores partition.
+        self.send_to_partition_bytes(
+            topic,
+            partition,
+            bytes::Bytes::copy_from_slice(payload),
+        )
+        .await
+    }
+
+    /// Same as [`Self::send_to_partition`] but takes a pre-built
+    /// `Bytes` payload — no `copy_from_slice` step on the way in.
+    /// Use this from forwarding paths or any caller that already
+    /// has a refcounted buffer.
+    pub async fn send_to_partition_bytes(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        payload: bytes::Bytes,
+    ) -> Result<u64> {
         let resp = self
             .inner
             .send(self.auth(proto::SendRequest {
                 topic: topic.to_string(),
-                key: partition.to_le_bytes().to_vec(),
-                payload: payload.to_vec(),
+                key: bytes::Bytes::from(partition.to_le_bytes().to_vec()),
+                payload,
             }))
             .await?;
         Ok(resp.into_inner().record_id)
     }
 
+    /// Batch-send `items` (each is a `(key, payload)` pair carried
+    /// as refcounted `Bytes`). Refcounted because the broker's
+    /// forwarding path already holds the originating record buffers
+    /// as `Bytes` and needs to hand them straight to tonic without
+    /// reallocating per record — prost's encoder serialises `Bytes`
+    /// zero-copy.
     pub async fn send_batch(
         &mut self,
         topic: &str,
-        items: Vec<(Vec<u8>, Vec<u8>)>,
+        items: Vec<(bytes::Bytes, bytes::Bytes)>,
     ) -> Result<Vec<(u32, u64)>> {
         let resp = self
             .inner

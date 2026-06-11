@@ -474,6 +474,8 @@ async fn replicated_topic_distributes_sends_to_all_replicas_via_raft() {
             visibility_timeout: std::time::Duration::from_secs(30),
             max_attempts: 5,
             durable_send: false,
+            eventual_commits: false,
+            track_message_state: true,
         },
     };
     let topics: Vec<Arc<Mutex<Topic>>> = tmp_dirs
@@ -481,12 +483,12 @@ async fn replicated_topic_distributes_sends_to_all_replicas_via_raft() {
         .map(|d| Arc::new(Mutex::new(Topic::open(d.path(), cfg.clone()).unwrap())))
         .collect();
 
-    type Applier = Arc<dyn Fn(&[u8]) + Send + Sync>;
+    type Applier = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
     let appliers: Vec<Applier> = topics
         .iter()
         .map(|t| {
             let t = t.clone();
-            let cb: Applier = Arc::new(move |bytes: &[u8]| {
+            let cb: Applier = Arc::new(move |_idx: u64, bytes: &[u8]| {
                 let cmd: TopicCommand = serde_json::from_slice(bytes).unwrap();
                 match cmd {
                     TopicCommand::Send { key, payload } => {
@@ -521,7 +523,7 @@ async fn replicated_topic_distributes_sends_to_all_replicas_via_raft() {
             "node {i} expected one replicated message, got {}",
             batch.len()
         );
-        assert_eq!(batch[0].payload, b"buy(QX)");
+        assert_eq!(&batch[0].payload[..], b"buy(QX)");
     }
 }
 

@@ -354,7 +354,7 @@ impl ReplicatedTopic {
             .iter()
             .map(|state| {
                 let state = state.clone();
-                let cb: ApplyCallback = Arc::new(move |bytes: &[u8]| {
+                let cb: ApplyCallback = Arc::new(move |_index: u64, bytes: &[u8]| {
                     let Ok(cmd) = serde_json::from_slice::<Command>(bytes) else {
                         return;
                     };
@@ -651,7 +651,7 @@ fn make_appliers(states: &[Arc<Mutex<NodeTopicState>>]) -> Vec<ApplyCallback> {
         .iter()
         .map(|state| {
             let state = state.clone();
-            let cb: ApplyCallback = Arc::new(move |bytes: &[u8]| {
+            let cb: ApplyCallback = Arc::new(move |_index: u64, bytes: &[u8]| {
                 let Ok(cmd) = serde_json::from_slice::<Command>(bytes) else {
                     return;
                 };

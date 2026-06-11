@@ -12,16 +12,22 @@ members = [
     "crates/qxd",
     "crates/qx-cli",
     "examples/orders-pipeline",
+    "examples/raft-cluster",
 ]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "Apache-2.0"
 
 [workspace.dependencies]
 thiserror = "2"
 crc32fast = "1"
+crc32c = "0.6"
+snap = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
+flate2 = "1"
+zstd = { version = "0.13", default-features = false }
 tempfile = "3"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 redb = "2"
@@ -29,13 +35,25 @@ xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 prost = "0.13"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal", "process"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 openraft = { version = "0.9", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
+futures = "0.3"
+bytes = "1"
+crossbeam-channel = "0.5"
+core_affinity = "0.8"
+num_cpus = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+base64 = "0.22"
+rand = "0.8"
 
 [profile.release]
 lto = "thin"

@@ -149,13 +149,23 @@ impl PersistentStorage {
     /// Raft log: openraft may have taken a snapshot and purged early Raft
     /// log entries, but the state machine log on disk reflects every applied
     /// payload (load_on_open + apply both push to it).
+    /// Walk the persisted state-machine log front-to-back and invoke
+    /// `callback` for every entry with a synthetic raft-index (the
+    /// 1-based position in the log). Used by in-memory state machines
+    /// (e.g. `ReplicatedTopic`) to rebuild on restart.
+    ///
+    /// Persistent broker state should NOT use replay — its applier
+    /// uses the real Raft log index to drive an idempotency cursor.
     pub async fn replay_to_callback<F>(&self, mut callback: F) -> crate::error::Result<()>
     where
-        F: FnMut(&[u8]),
+        F: FnMut(u64, &[u8]),
     {
         let inner = self.inner.lock().await;
-        for payload in &inner.state_machine.log {
-            callback(payload);
+        for (i, payload) in inner.state_machine.log.iter().enumerate() {
+            // synthetic 1-based index — replay isn't tied to the real
+            // raft log index because the in-memory log only stores
+            // payloads, not log ids.
+            callback((i as u64) + 1, payload);
         }
         Ok(())
     }
@@ -456,7 +466,7 @@ impl RaftStorage<TypeConfig> for PersistentStorage {
                         index: new_len as u64 - 1,
                     });
                     if let Some(cb) = &self.apply_callback {
-                        cb(&req.payload);
+                        cb(entry.log_id.index, &req.payload);
                     }
                 }
                 EntryPayload::Membership(m) => {

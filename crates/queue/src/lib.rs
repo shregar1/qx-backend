@@ -10,6 +10,7 @@
 
 mod error;
 mod queue;
+mod ranges;
 mod state;
 
 pub use error::{QueueError, Result};
