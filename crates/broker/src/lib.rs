@@ -4,6 +4,7 @@
 //!   `Broker`  — server-side state holder; `Broker::open(dir)` + `.serve(addr)`.
 //!   `Client`  — high-level client over the generated tonic stub.
 
+pub mod admin_api;
 mod client;
 mod error;
 mod groups;

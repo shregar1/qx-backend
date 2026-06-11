@@ -177,6 +177,10 @@ pub struct Broker {
     /// in-flight transaction partitions in memory but does NOT filter
     /// uncommitted records on Fetch yet.
     txn_registry: Arc<crate::kafka::transactions::TxnRegistry>,
+    /// Process start time, used by the dashboard's `/api/nodes` JSON
+    /// to compute `uptimeSeconds`. Captured at `open_with_config`
+    /// time, monotonic — survives wall-clock jumps.
+    started_at: std::time::Instant,
     /// ACL store backing CreateAcls / DeleteAcls / DescribeAcls and the
     /// per-request authorization gate. In-memory; starts empty (all
     /// requests allowed) until an operator creates the first ACL, at
@@ -312,6 +316,7 @@ impl Broker {
             produce_writers: Mutex::new(HashMap::new()),
             low_watermarks: Mutex::new(HashMap::new()),
             txn_registry,
+            started_at: std::time::Instant::now(),
             acls: Arc::new(crate::kafka::acls::AclStore::new()),
             // Per-core sharded writes are now an explicit opt-in via
             // `BrokerConfig::per_core_shards` rather than tied to
@@ -335,6 +340,39 @@ impl Broker {
             grpc_cluster_for_snapshot: std::sync::OnceLock::new(),
             config,
         })
+    }
+
+    /// Wall-clock seconds since `open_with_config` returned. Used
+    /// by `/api/health` and `/api/nodes` for the dashboard.
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// Best-effort "where am I reachable" for the admin API's nodes
+    /// list. Returns the configured client-facing peer addr for this
+    /// node id, or `None` in single-node mode where the dashboard
+    /// will render "self".
+    pub fn advertised_addr(&self) -> Option<String> {
+        let cluster = self.config.cluster.as_ref()?;
+        cluster
+            .client_addrs
+            .iter()
+            .find(|(id, _)| *id == cluster.node_id)
+            .map(|(_, a)| a.clone())
+    }
+
+    /// Configured `(node_id, client-facing addr)` for every peer
+    /// broker, excluding self. Empty in single-node mode.
+    pub fn peer_addrs(&self) -> Vec<(u64, String)> {
+        let Some(cluster) = self.config.cluster.as_ref() else {
+            return Vec::new();
+        };
+        cluster
+            .client_addrs
+            .iter()
+            .filter(|(id, _)| *id != cluster.node_id)
+            .cloned()
+            .collect()
     }
 
     /// Return this broker's `NodeId` if cluster mode is configured.
@@ -1111,8 +1149,8 @@ impl Broker {
         &self,
         workflow: &str,
         task_id: u64,
-        result: Vec<u8>,
-        emits: &[(&str, &[u8])],
+        result: impl Into<bytes::Bytes>,
+        emits: &[(&str, bytes::Bytes)],
     ) -> Result<Vec<u64>> {
         let engine = self.get_or_open_workflow(workflow)?;
         let mut e = engine.lock().unwrap();
@@ -2050,8 +2088,15 @@ impl BrokerSvcTrait for BrokerSvc {
         let req = req.into_inner();
         let broker = self.broker.clone();
         tokio::task::spawn_blocking(move || {
-            let emits: Vec<(&str, &[u8])> =
-                req.emits.iter().map(|e| (e.topic.as_str(), e.payload.as_slice())).collect();
+            // Borrow `&str` from `req.emits[i].topic` and clone the
+            // refcounted `Bytes` payload. The clone is a refcount
+            // bump (not a memcpy); the engine then moves the same
+            // Bytes into `PendingEmit::payload` without re-allocating.
+            let emits: Vec<(&str, bytes::Bytes)> = req
+                .emits
+                .iter()
+                .map(|e| (e.topic.as_ref(), e.payload.clone()))
+                .collect();
             broker
                 .complete_task_with_emits(&req.workflow, req.task_id, req.result, &emits)
                 .map(|_| ())
@@ -2277,18 +2322,45 @@ async fn handle_metrics_connection(
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // One-shot read of the request head. The dashboard polling
+    // pattern is short GETs — the entire request fits well under 4
+    // KiB. Pipelined requests aren't supported (the handler closes
+    // the connection after one response).
     let mut buf = vec![0u8; 4096];
-    let _ = stream.read(&mut buf).await?;
+    let n = stream.read(&mut buf).await?;
+    let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
 
-    let body = match broker.all_stats() {
-        Ok(stats) => format_metrics(&stats),
-        Err(e) => format!("# error: {e}\n"),
+    // Parse: METHOD SP PATH SP VERSION  (we only care about method + path).
+    let mut iter = head.split_whitespace();
+    let method = iter.next().unwrap_or("");
+    let path = iter.next().unwrap_or("");
+
+    // CORS preflight: blanket permissive. The admin API is read-
+    // only; the dev dashboard at vite :5173 needs OPTIONS to clear.
+    if method == "OPTIONS" {
+        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Max-Age: 600\r\nConnection: close\r\n\r\n";
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    // Route. /metrics keeps its prior Prometheus contract; /api/*
+    // is the dashboard JSON surface; everything else 404s.
+    let (status, content_type, body) = if path == "/metrics" || path == "/" {
+        let body = match broker.all_stats() {
+            Ok(stats) => format_metrics(&stats),
+            Err(e) => format!("# error: {e}\n"),
+        };
+        ("200 OK", "text/plain; version=0.0.4; charset=utf-8", body)
+    } else if let Some(json) = crate::admin_api::render_route(path, &broker) {
+        ("200 OK", "application/json", json)
+    } else {
+        ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string())
     };
 
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
