@@ -181,6 +181,12 @@ pub struct Broker {
     /// to compute `uptimeSeconds`. Captured at `open_with_config`
     /// time, monotonic — survives wall-clock jumps.
     started_at: std::time::Instant,
+    /// Per-topic Produce counters. Bumped from the produce handler
+    /// after every successful commit. The admin API turns the
+    /// running totals into msgsPerSec / bytesPerSec by sampling
+    /// deltas across requests.
+    topic_produce_metrics:
+        Mutex<HashMap<String, Arc<crate::admin_api::TopicMetricCounters>>>,
     /// ACL store backing CreateAcls / DeleteAcls / DescribeAcls and the
     /// per-request authorization gate. In-memory; starts empty (all
     /// requests allowed) until an operator creates the first ACL, at
@@ -317,6 +323,7 @@ impl Broker {
             low_watermarks: Mutex::new(HashMap::new()),
             txn_registry,
             started_at: std::time::Instant::now(),
+            topic_produce_metrics: Mutex::new(HashMap::new()),
             acls: Arc::new(crate::kafka::acls::AclStore::new()),
             // Per-core sharded writes are now an explicit opt-in via
             // `BrokerConfig::per_core_shards` rather than tied to
@@ -346,6 +353,132 @@ impl Broker {
     /// by `/api/health` and `/api/nodes` for the dashboard.
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Bump per-topic Produce counters. Called once per successful
+    /// commit from the Kafka produce handler. Cheap — atomic adds
+    /// only, no per-call allocation after the first record for a
+    /// topic.
+    pub fn record_produce_success(&self, topic: &str, msg_count: u64, byte_count: u64) {
+        let counters = {
+            let mut map = self.topic_produce_metrics.lock().unwrap();
+            if let Some(c) = map.get(topic) {
+                c.clone()
+            } else {
+                let c = Arc::new(crate::admin_api::TopicMetricCounters::default());
+                map.insert(topic.to_string(), c.clone());
+                c
+            }
+        };
+        counters.record(msg_count, byte_count);
+    }
+
+    /// Snapshot of every topic's running Produce totals. The admin
+    /// API rate-converts these via its delta cache.
+    pub fn topic_metric_totals(&self) -> Vec<(String, u64, u64)> {
+        self.topic_produce_metrics
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, c)| {
+                (
+                    name.clone(),
+                    c.total_msgs.load(std::sync::atomic::Ordering::Relaxed),
+                    c.total_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    /// High-water mark (next-record-id) for one partition. Used by
+    /// the admin API to join Kafka consumer-group committed offsets
+    /// into lag values.
+    pub fn partition_high_water(&self, topic: &str, partition: u32) -> Option<u64> {
+        let arc = {
+            let topics = self.topics.lock().unwrap();
+            topics.get(topic).cloned()
+        }?;
+        arc.partition_end_offset(partition).ok()
+    }
+
+    /// One DTO per (topic, group_id) registered with the gRPC
+    /// group coordinator. Reads through the broker's groups mutex
+    /// once and clones out the fields the admin API needs.
+    pub fn grpc_groups_snapshot(&self) -> Vec<crate::admin_api::GrpcGroupEntry> {
+        let groups = self.groups.lock().unwrap();
+        groups
+            .iter()
+            .map(|((topic, group_id), arc)| {
+                let g = arc.lock().unwrap();
+                crate::admin_api::GrpcGroupEntry {
+                    group_id: group_id.clone(),
+                    topic: topic.clone(),
+                    member_count: g.member_count(),
+                    generation: g.generation(),
+                }
+            })
+            .collect()
+    }
+
+    /// Ask every Kafka coordinator for its snapshot, in parallel.
+    /// Each coordinator owns its state in a tokio actor so we round-
+    /// trip via oneshot; the futures join independently. Slow / dead
+    /// coordinators are dropped from the result rather than blocking
+    /// the whole admin response.
+    pub async fn kafka_groups_snapshot(
+        &self,
+    ) -> Vec<crate::admin_api::KafkaGroupSnapshotEntry> {
+        let handles: Vec<(String, crate::kafka::group_coordinator::CoordinatorHandle)> = {
+            let map = self.group_coordinators.lock().unwrap();
+            map.iter()
+                .map(|(name, h)| (name.clone(), h.clone()))
+                .collect()
+        };
+        // Concurrent fan-out: one oneshot per coordinator. Bounded
+        // wait so a hung coordinator can't stall the dashboard.
+        let futures = handles.into_iter().map(|(group_id, handle)| async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle.send(crate::kafka::group_coordinator::GroupMsg::Snapshot {
+                respond_to: tx,
+            });
+            let snap: crate::admin_api::KafkaGroupSnapshot =
+                tokio::time::timeout(std::time::Duration::from_millis(250), rx)
+                    .await
+                    .ok()?
+                    .ok()?;
+            Some(crate::admin_api::KafkaGroupSnapshotEntry {
+                group_id,
+                state: snap.state,
+                generation: snap.generation,
+                member_count: snap.member_count,
+                committed: snap.committed,
+            })
+        });
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Aggregate task counts per named workflow registry. The
+    /// `workflow_stats` returns `(name, EngineStats)` per registry
+    /// the broker has materialised; engines are sync-locked so the
+    /// scan happens on the calling tokio worker — cheap for the
+    /// dashboard's sub-second-or-so granularity.
+    pub fn workflow_stats(&self) -> Vec<(String, qx_workflow::EngineStats)> {
+        let snaps: Vec<(String, Arc<Mutex<qx_workflow::Engine>>)> = {
+            let workflows = self.workflows.lock().unwrap();
+            workflows.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        snaps
+            .into_iter()
+            .filter_map(|(name, arc)| {
+                let engine = arc.lock().ok()?;
+                let stats = engine.stats().ok()?;
+                Some((name, stats))
+            })
+            .collect()
     }
 
     /// Best-effort "where am I reachable" for the admin API's nodes
@@ -494,9 +627,22 @@ impl Broker {
             let me = self.clone();
             let topic = topic.clone();
             let topic_name_inner = topic_name_owned.clone();
+            // Sum byte count for the metric bump on success. Done
+            // before the move into the async block so we don't
+            // touch payloads again past replicate_produce.
+            let partition_byte_count: u64 =
+                payloads.iter().map(|b| b.len() as u64).sum();
+            let partition_msg_count = payloads.len() as u64;
             futures.push(async move {
                 match me.replicator().replicate_produce(topic.clone(), cmd).await {
-                    Ok(ids) => Ok((partition, original_indexes, ids)),
+                    Ok(ids) => {
+                        me.record_produce_success(
+                            &topic_name_inner,
+                            partition_msg_count,
+                            partition_byte_count,
+                        );
+                        Ok((partition, original_indexes, ids))
+                    }
                     Err(TopicError::Other(msg)) if is_forward_to_leader(&msg) => {
                         // Forward this partition's slice to the leader
                         // via the existing gRPC `send_batch`. The
@@ -562,18 +708,22 @@ impl Broker {
         payload: bytes::Bytes,
     ) -> std::result::Result<(u32, u64), TopicError> {
         let partition = topic.partition_for_key(&key);
+        let payload_len = payload.len() as u64;
         let cmd = crate::replication::ProduceCommand {
             topic: topic_name.to_string(),
             partition,
             payloads: vec![payload.clone()],
         };
         match self.replicator().replicate_produce(topic.clone(), cmd).await {
-            Ok(ids) => Ok((
-                partition,
-                ids.first().copied().ok_or_else(|| {
-                    TopicError::Other("replicator returned no record id".into())
-                })?,
-            )),
+            Ok(ids) => {
+                self.record_produce_success(topic_name, 1, payload_len);
+                Ok((
+                    partition,
+                    ids.first().copied().ok_or_else(|| {
+                        TopicError::Other("replicator returned no record id".into())
+                    })?,
+                ))
+            }
             Err(TopicError::Other(msg)) if is_forward_to_leader(&msg) => {
                 let leader_id = parse_forward_to_leader(&msg).ok_or_else(|| {
                     TopicError::Other(format!("ForwardToLeader without leader_id: {msg}"))
@@ -2352,7 +2502,7 @@ async fn handle_metrics_connection(
             Err(e) => format!("# error: {e}\n"),
         };
         ("200 OK", "text/plain; version=0.0.4; charset=utf-8", body)
-    } else if let Some(json) = crate::admin_api::render_route(path, &broker) {
+    } else if let Some(json) = crate::admin_api::render_route(path, &broker).await {
         ("200 OK", "application/json", json)
     } else {
         ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string())

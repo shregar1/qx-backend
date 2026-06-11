@@ -69,7 +69,14 @@ impl ConsumerGroup {
         self.members.get(&member_id).map(|m| m.assignment.clone())
     }
 
-    #[cfg(test)]
+    /// Number of currently-tracked members (no eviction sweep — the
+    /// dashboard reads this from inside the broker's group mutex,
+    /// and the eviction sweep is mutating; preserving "read does not
+    /// mutate" keeps the snapshot semantics clean).
+    pub fn member_count(&self) -> u32 {
+        self.members.len() as u32
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

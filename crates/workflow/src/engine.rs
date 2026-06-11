@@ -44,6 +44,17 @@ pub struct Engine {
     encode_buf: Vec<u8>,
 }
 
+/// Aggregate counts produced by [`Engine::stats`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EngineStats {
+    pub total: u64,
+    pub pending: u64,
+    pub running: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+}
+
 impl Engine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -54,7 +65,12 @@ impl Engine {
         ensure_schema(&db)?;
         Ok(Self {
             db,
-            encode_buf: Vec::new(),
+            // Pre-grow the encode scratch to a sensible default so
+            // the first `create` / `complete_with_emits` doesn't pay
+            // the growth-from-0 cost. 1 KiB covers ~one task header
+            // + payload + result for typical workflows; larger
+            // payloads still re-grow naturally on first encode.
+            encode_buf: Vec::with_capacity(1024),
         })
     }
 
@@ -184,12 +200,17 @@ impl Engine {
         let write_txn = self.db.begin_write()?;
         {
             let mut tasks = write_txn.open_table(TASKS_TABLE)?;
-            let bytes = tasks
-                .get(id)?
-                .ok_or(WorkflowError::TaskNotFound { id })?
-                .value()
-                .to_vec();
-            let mut task = Task::decode(id, &bytes)?;
+            // Move the redb-read bytes straight into a `Bytes`, then
+            // let `decode_from` slice `payload`/`result` views into
+            // that single allocation via refcount bumps.
+            let buf = bytes::Bytes::from(
+                tasks
+                    .get(id)?
+                    .ok_or(WorkflowError::TaskNotFound { id })?
+                    .value()
+                    .to_vec(),
+            );
+            let mut task = Task::decode_from(id, buf)?;
             if task.status.is_terminal() {
                 return Err(WorkflowError::TerminalTask { id });
             }
@@ -282,11 +303,11 @@ impl Engine {
         {
             let mut tasks = write_txn.open_table(TASKS_TABLE)?;
             for tid in &to_cancel {
-                let bytes = match tasks.get(*tid)? {
-                    Some(g) => g.value().to_vec(),
+                let buf = match tasks.get(*tid)? {
+                    Some(g) => bytes::Bytes::from(g.value().to_vec()),
                     None => continue,
                 };
-                let mut t = Task::decode(*tid, &bytes)?;
+                let mut t = Task::decode_from(*tid, buf)?;
                 if t.status.is_terminal() {
                     continue;
                 }
@@ -300,11 +321,41 @@ impl Engine {
         Ok(cancelled)
     }
 
+    /// Aggregate task counts by status across the whole workflow.
+    /// Cheap because we only inspect the first byte of each encoded
+    /// task — the status byte is the encoding's prefix, so a full
+    /// `Task::decode` is unnecessary. One read transaction, no
+    /// allocations beyond the returned struct.
+    pub fn stats(&self) -> Result<EngineStats> {
+        let read_txn = self.db.begin_read()?;
+        let tasks = read_txn.open_table(TASKS_TABLE)?;
+        let mut stats = EngineStats::default();
+        for entry in tasks.iter()? {
+            let (_, v) = entry?;
+            stats.total += 1;
+            let bytes = v.value();
+            if let Some(first) = bytes.first() {
+                match TaskStatus::from_u8(*first) {
+                    Ok(TaskStatus::Pending) => stats.pending += 1,
+                    Ok(TaskStatus::Running) => stats.running += 1,
+                    Ok(TaskStatus::Done) => stats.done += 1,
+                    Ok(TaskStatus::Failed) => stats.failed += 1,
+                    Ok(TaskStatus::Cancelled) => stats.cancelled += 1,
+                    Err(_) => {}
+                }
+            }
+        }
+        Ok(stats)
+    }
+
     pub fn get(&self, id: TaskId) -> Result<Option<Task>> {
         let read_txn = self.db.begin_read()?;
         let tasks = read_txn.open_table(TASKS_TABLE)?;
         match tasks.get(id)? {
-            Some(g) => Ok(Some(Task::decode(id, g.value())?)),
+            Some(g) => Ok(Some(Task::decode_from(
+                id,
+                bytes::Bytes::from(g.value().to_vec()),
+            )?)),
             None => Ok(None),
         }
     }
@@ -356,12 +407,14 @@ impl Engine {
         let write_txn = self.db.begin_write()?;
         {
             let mut tasks = write_txn.open_table(TASKS_TABLE)?;
-            let bytes = tasks
-                .get(id)?
-                .ok_or(WorkflowError::TaskNotFound { id })?
-                .value()
-                .to_vec();
-            let mut task = Task::decode(id, &bytes)?;
+            let buf = bytes::Bytes::from(
+                tasks
+                    .get(id)?
+                    .ok_or(WorkflowError::TaskNotFound { id })?
+                    .value()
+                    .to_vec(),
+            );
+            let mut task = Task::decode_from(id, buf)?;
             mutate(&mut task)?;
             task.encode_into(&mut self.encode_buf);
             tasks.insert(id, self.encode_buf.as_slice())?;

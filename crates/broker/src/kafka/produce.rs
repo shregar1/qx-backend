@@ -362,6 +362,12 @@ async fn produce_one_partition(
             .into_iter()
             .map(|r| r.value.unwrap_or_default())
             .collect();
+        // Total bytes attributed to this partition's batch — used
+        // below to bump the per-topic metrics counters once we know
+        // the commit succeeded.
+        let attempted_msg_count = payloads_owned.len() as u64;
+        let attempted_byte_count: u64 =
+            payloads_owned.iter().map(|b| b.len() as u64).sum();
         let send_result: Result<Vec<u64>, (i16, String)> = if payloads_owned.is_empty() {
             Ok(Vec::new())
         } else if let Some(pool) = broker.shard_pool() {
@@ -447,6 +453,15 @@ async fn produce_one_partition(
                 if let Some(last) = ids.last() {
                     batch_last_offset = Some(*last as i64);
                 }
+                // Bookkeeping for the admin API: every committed
+                // payload contributes to this topic's running
+                // msg/byte totals. Done on the success branch so a
+                // rejected batch doesn't inflate the rate.
+                broker.record_produce_success(
+                    topic_name,
+                    attempted_msg_count,
+                    attempted_byte_count,
+                );
             }
             Err(err) => {
                 first_err = Some(err);

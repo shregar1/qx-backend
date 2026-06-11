@@ -9,6 +9,6 @@ mod engine;
 mod error;
 mod task;
 
-pub use engine::{Engine, PendingEmit};
+pub use engine::{Engine, EngineStats, PendingEmit};
 pub use error::{Result, WorkflowError};
 pub use task::{Task, TaskId, TaskStatus};

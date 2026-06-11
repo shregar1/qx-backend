@@ -176,7 +176,27 @@ pub enum GroupMsg {
     OffsetFetch(OffsetFetchRequest),
     OffsetDelete(OffsetDeleteRequest),
     Describe(DescribeRequest),
+    /// Read-only introspection for the admin API. Returns one row
+    /// per (topic, partition) committed by this group. Cheap — just
+    /// clones in-memory state.
+    Snapshot {
+        respond_to: oneshot::Sender<GroupSnapshot>,
+    },
     Shutdown,
+}
+
+/// In-memory snapshot of a coordinator's state. Returned by
+/// `GroupMsg::Snapshot`; consumed by the admin API to populate
+/// `/api/groups` without holding any actor-side state.
+#[derive(Debug, Clone)]
+pub struct GroupSnapshot {
+    pub state: &'static str,
+    pub generation: i32,
+    pub member_count: u32,
+    /// `(topic, partition, committed_offset)` for every committed
+    /// position. The admin API aggregates these per-topic and joins
+    /// with the broker's high-water mark to compute lag.
+    pub committed: Vec<(String, i32, i64)>,
 }
 
 /// External handle: send messages to the coordinator over its mpsc inbox.
@@ -283,8 +303,29 @@ impl Coordinator {
             GroupMsg::OffsetFetch(req) => self.on_offset_fetch(req),
             GroupMsg::OffsetDelete(req) => self.on_offset_delete(req),
             GroupMsg::Describe(req) => self.on_describe(req),
+            GroupMsg::Snapshot { respond_to } => self.on_snapshot(respond_to),
             GroupMsg::Shutdown => {}
         }
+    }
+
+    fn on_snapshot(&self, respond_to: oneshot::Sender<GroupSnapshot>) {
+        let state = match self.state {
+            State::Empty => "Empty",
+            State::PreparingRebalance => "PreparingRebalance",
+            State::CompletingRebalance => "CompletingRebalance",
+            State::Stable => "Stable",
+        };
+        let committed: Vec<(String, i32, i64)> = self
+            .committed
+            .iter()
+            .map(|((topic, partition), offset)| (topic.clone(), *partition, *offset))
+            .collect();
+        let _ = respond_to.send(GroupSnapshot {
+            state,
+            generation: self.generation,
+            member_count: self.members.len() as u32,
+            committed,
+        });
     }
 
     fn on_describe(&self, req: DescribeRequest) {

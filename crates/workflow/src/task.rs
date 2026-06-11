@@ -95,7 +95,22 @@ impl Task {
         buf
     }
 
+    /// Compatibility wrapper for callers that still hand decode a
+    /// borrowed slice. Allocates once internally via `to_vec()` and
+    /// delegates to [`Self::decode_from`] so the `payload` and
+    /// `result` fields share that single allocation instead of each
+    /// paying their own `Bytes::copy_from_slice`.
     pub fn decode(id: TaskId, bytes: &[u8]) -> Result<Self> {
+        Self::decode_from(id, bytes::Bytes::from(bytes.to_vec()))
+    }
+
+    /// Take ownership of the encoded buffer (typically a redb
+    /// `AccessGuard::value().to_vec()` wrapped as `Bytes`) and slice
+    /// `payload` and `result` views out of it via refcount bumps.
+    /// One heap allocation per Task decode, regardless of how many
+    /// `Bytes` fields the encoding carries.
+    pub fn decode_from(id: TaskId, buf: bytes::Bytes) -> Result<Self> {
+        let bytes: &[u8] = &buf;
         if bytes.len() < HEADER_SIZE {
             return Err(WorkflowError::CorruptTask);
         }
@@ -112,8 +127,9 @@ impl Task {
         if bytes.len() < cursor + payload_len {
             return Err(WorkflowError::CorruptTask);
         }
-        let payload =
-            bytes::Bytes::copy_from_slice(&bytes[cursor..cursor + payload_len]);
+        // `Bytes::slice` is a refcount bump into the same allocation
+        // as `buf` — no realloc, no memcpy.
+        let payload = buf.slice(cursor..cursor + payload_len);
         cursor += payload_len;
 
         if bytes.len() < cursor + 4 {
@@ -125,9 +141,7 @@ impl Task {
             return Err(WorkflowError::CorruptTask);
         }
         let result = if result_len > 0 {
-            Some(bytes::Bytes::copy_from_slice(
-                &bytes[cursor..cursor + result_len],
-            ))
+            Some(buf.slice(cursor..cursor + result_len))
         } else {
             None
         };
