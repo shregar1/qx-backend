@@ -216,11 +216,23 @@ async fn dispatch_loop(
         let processed = match result {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
-                eprintln!("trigger '{}': iteration error: {}", config.name, e);
+                let msg = format!("trigger '{}': iteration error: {}", config.name, e);
+                eprintln!("{msg}");
+                broker.emit_event(
+                    crate::admin_api::EventLevel::Error,
+                    "triggers",
+                    msg,
+                );
                 0
             }
             Err(e) => {
-                eprintln!("trigger '{}': join error: {}", config.name, e);
+                let msg = format!("trigger '{}': join error: {}", config.name, e);
+                eprintln!("{msg}");
+                broker.emit_event(
+                    crate::admin_api::EventLevel::Error,
+                    "triggers",
+                    msg,
+                );
                 0
             }
         };

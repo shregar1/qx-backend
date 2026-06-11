@@ -42,6 +42,44 @@ pub struct Engine {
     /// writes, so concurrent access is already impossible — no lock
     /// is needed around the scratch buffer.
     encode_buf: Vec<u8>,
+    /// Captured from [`EngineOptions::cancel_max_descendants`] at
+    /// open. `0` means unlimited.
+    cancel_max_descendants: usize,
+}
+
+/// Per-engine knobs supplied to [`Engine::with_options`]. Default
+/// values preserve [`Engine::open`]'s historic behaviour.
+#[derive(Debug, Clone)]
+pub struct EngineOptions {
+    /// Initial capacity for the engine-internal `encode_buf` scratch.
+    /// Sized to cover the typical task's header + payload + result
+    /// so the first `create` / `complete_with_emits` doesn't pay a
+    /// growth-from-0 cost. Workloads with consistently-large
+    /// payloads should set this to their p99 task size; small
+    /// workloads can lower it.
+    pub encode_buf_capacity: usize,
+    /// Upper bound on the number of descendants `Engine::cancel`
+    /// will collect before refusing the operation. Defends against a
+    /// runaway task tree (corruption, a bug that creates children
+    /// in a cycle, etc.). `0` disables the guard — the historic
+    /// behaviour, unbounded.
+    pub cancel_max_descendants: usize,
+    /// Optional redb page cache size, in bytes. When `Some`, the
+    /// engine's redb database is built via
+    /// `Builder::set_cache_size(...)`. Larger caches reduce disk
+    /// reads on workflows that repeatedly inspect the same tasks;
+    /// `None` accepts redb's own default.
+    pub redb_cache_bytes: Option<usize>,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            encode_buf_capacity: 1024,
+            cancel_max_descendants: 0,
+            redb_cache_bytes: None,
+        }
+    }
 }
 
 /// Aggregate counts produced by [`Engine::stats`].
@@ -57,20 +95,35 @@ pub struct EngineStats {
 
 impl Engine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_options(path, EngineOptions::default())
+    }
+
+    /// Open with a caller-supplied [`EngineOptions`]. Operators with
+    /// known-large task payloads can set
+    /// [`EngineOptions::encode_buf_capacity`] to their p99 task size
+    /// so even the first redb insert avoids growing the scratch.
+    pub fn with_options(
+        path: impl AsRef<Path>,
+        options: EngineOptions,
+    ) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Database::create(path)?;
+        // Use redb's `Builder` so the caller can size the page cache.
+        // `Database::create` is shorthand for "builder with defaults
+        // → create or open"; we replicate it via the builder to get
+        // at the cache knob.
+        let mut builder = redb::Builder::new();
+        if let Some(cache) = options.redb_cache_bytes {
+            builder.set_cache_size(cache);
+        }
+        let db = builder.create(path)?;
         ensure_schema(&db)?;
         Ok(Self {
             db,
-            // Pre-grow the encode scratch to a sensible default so
-            // the first `create` / `complete_with_emits` doesn't pay
-            // the growth-from-0 cost. 1 KiB covers ~one task header
-            // + payload + result for typical workflows; larger
-            // payloads still re-grow naturally on first encode.
-            encode_buf: Vec::with_capacity(1024),
+            encode_buf: Vec::with_capacity(options.encode_buf_capacity),
+            cancel_max_descendants: options.cancel_max_descendants,
         })
     }
 
@@ -277,12 +330,19 @@ impl Engine {
     }
 
     pub fn fail(&mut self, id: TaskId, error: String) -> Result<()> {
+        self.fail_bytes(id, bytes::Bytes::from(error.into_bytes()))
+    }
+
+    /// `Bytes`-accepting variant of [`Self::fail`]. Skips the
+    /// `String → Bytes` move when the caller already holds a
+    /// refcounted error buffer.
+    pub fn fail_bytes(&mut self, id: TaskId, error: bytes::Bytes) -> Result<()> {
         self.update(id, |task| {
             if task.status.is_terminal() {
                 Err(WorkflowError::TerminalTask { id })
             } else {
                 task.status = TaskStatus::Failed;
-                task.error = Some(error);
+                task.error = Some(error.clone());
                 Ok(())
             }
         })
@@ -294,6 +354,18 @@ impl Engine {
         while frontier < to_cancel.len() {
             let current = to_cancel[frontier];
             let kids = self.children(current)?;
+            // Pre-check: refuse BEFORE growing `to_cancel`, so a
+            // single oversized `children(current)` response can't
+            // push the set past the cap. Honours
+            // `EngineOptions::cancel_max_descendants` — 0 means
+            // unlimited.
+            if self.cancel_max_descendants > 0
+                && to_cancel.len() + kids.len() > self.cancel_max_descendants
+            {
+                return Err(WorkflowError::CancelFanoutExceeded {
+                    limit: self.cancel_max_descendants,
+                });
+            }
             to_cancel.extend(kids);
             frontier += 1;
         }

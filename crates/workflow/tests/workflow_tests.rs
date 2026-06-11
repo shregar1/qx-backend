@@ -160,7 +160,7 @@ fn fail_stores_error_message() {
     e.fail(id, "timeout".into()).unwrap();
     let t = e.get(id).unwrap().unwrap();
     assert_eq!(t.status, TaskStatus::Failed);
-    assert_eq!(t.error.as_deref(), Some("timeout"));
+    assert_eq!(t.error_str().and_then(|r| r.ok()), Some("timeout"));
 }
 
 #[test]

@@ -8,6 +8,7 @@ description = "QX broker daemon — runs the gRPC service and the Prometheus met
 
 [dependencies]
 qx-broker = { path = "../broker" }
+qx-workflow = { path = "../workflow" }
 tokio.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml.workspace = true

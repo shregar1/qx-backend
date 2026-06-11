@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // refcount-shared instead of memcpying through Vec<u8>.
             ".qx.v1.TaskMessage.payload",
             ".qx.v1.TaskMessage.result",
+            ".qx.v1.TaskMessage.error",
             // Workflow task creation + completion bytes — keep the
             // refcounted-buffer path symmetric on both sides of the
             // RPC. CompleteTaskWithEmits ferries one result plus N

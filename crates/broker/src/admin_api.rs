@@ -17,13 +17,12 @@
 //! dashboard can fetch from a different origin (Vite at :5173) without
 //! a CORS proxy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tokio::sync::oneshot;
 
 use crate::server::Broker;
 
@@ -84,6 +83,71 @@ pub struct EventLine {
     pub level: &'static str,
     pub source: String,
     pub message: String,
+}
+
+/// Compile-time-known event severities. Stored as `&'static str` on
+/// the wire so each event line costs no per-level allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl EventLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventLevel::Info => "info",
+            EventLevel::Warn => "warn",
+            EventLevel::Error => "error",
+        }
+    }
+}
+
+/// Bounded ring buffer. Each event gets a unique monotonic id so the
+/// dashboard can de-dupe across overlapping polls. Backed by
+/// `VecDeque` — push_back + pop_front are both O(1).
+pub struct EventRing {
+    capacity: usize,
+    next_id: AtomicU64,
+    inner: Mutex<VecDeque<EventLine>>,
+}
+
+impl EventRing {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            next_id: AtomicU64::new(0),
+            inner: Mutex::new(VecDeque::with_capacity(capacity)),
+        }
+    }
+
+    pub fn push(&self, level: EventLevel, source: &str, message: String) {
+        // Monotonic timestamp (ms) for the wire. UI sorts/groups by
+        // this — SystemTime is fine because dashboard polling lives
+        // on the order of seconds, not nanoseconds.
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let line = EventLine {
+            id: format!("evt-{id}"),
+            ts,
+            level: level.as_str(),
+            source: source.to_string(),
+            message,
+        };
+        let mut buf = self.inner.lock().unwrap();
+        if buf.len() == self.capacity {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+
+    pub fn snapshot(&self) -> Vec<EventLine> {
+        self.inner.lock().unwrap().iter().cloned().collect()
+    }
 }
 
 /// Atomic counters bumped from the Produce path. The admin API
@@ -305,12 +369,8 @@ pub fn workflows_snapshot(broker: &Broker) -> Vec<WorkflowStat> {
         .collect()
 }
 
-pub fn events_snapshot(_broker: &Broker) -> Vec<EventLine> {
-    // No structured event bus yet — the broker emits to tracing/log
-    // facade. Surfacing them in real time would need a ring buffer
-    // wired into a tracing subscriber; left as a follow-up. The UI
-    // shows an honest "no events" panel.
-    Vec::new()
+pub fn events_snapshot(broker: &Broker) -> Vec<EventLine> {
+    broker.events_snapshot()
 }
 
 /// Render the JSON body for a given path. Unknown paths return None.

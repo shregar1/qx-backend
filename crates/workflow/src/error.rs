@@ -16,6 +16,9 @@ pub enum WorkflowError {
 
     #[error("corrupt task record")]
     CorruptTask,
+
+    #[error("cancel descendant set exceeds limit ({limit})")]
+    CancelFanoutExceeded { limit: usize },
 }
 
 macro_rules! redb_from {

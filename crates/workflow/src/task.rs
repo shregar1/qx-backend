@@ -54,10 +54,26 @@ pub struct Task {
     /// hands these straight to prost without re-buffering.
     pub payload: bytes::Bytes,
     pub result: Option<bytes::Bytes>,
-    pub error: Option<String>,
+    /// Error message. Stored as `Bytes` so decoding can refcount-share
+    /// the same buffer that `payload` and `result` slice into — no
+    /// `String::from_utf8` `to_vec` on the cold error path. UTF-8 is
+    /// validated once at decode time via `str::from_utf8` (a borrow,
+    /// not a copy). Callers fetch the text view through
+    /// [`Self::error_str`].
+    pub error: Option<bytes::Bytes>,
 }
 
 impl Task {
+    /// UTF-8 view into `error`. Returns `None` if the task has no
+    /// error attached. Returns `Some(Err(_))` only if the persisted
+    /// bytes are somehow not valid UTF-8 — `decode_from` validates on
+    /// load so this case is unreachable for tasks produced by this
+    /// codebase, but the API stays explicit about the failure mode
+    /// for callers that construct a `Task` manually.
+    pub fn error_str(&self) -> Option<std::result::Result<&str, std::str::Utf8Error>> {
+        self.error.as_ref().map(|b| std::str::from_utf8(b))
+    }
+
     /// Encode into a caller-provided buffer, reusing its allocation.
     /// The engine pools one `encode_buf` across every task write in a
     /// transaction so a long completion loop doesn't allocate a
@@ -65,7 +81,7 @@ impl Task {
     /// can pass a recycled scratch.
     pub fn encode_into(&self, buf: &mut Vec<u8>) {
         let result_bytes: &[u8] = self.result.as_deref().unwrap_or(&[]);
-        let error_bytes: &[u8] = self.error.as_deref().map(str::as_bytes).unwrap_or(b"");
+        let error_bytes: &[u8] = self.error.as_deref().unwrap_or(b"");
         let needed =
             HEADER_SIZE + self.payload.len() + result_bytes.len() + error_bytes.len();
         buf.clear();
@@ -156,10 +172,14 @@ impl Task {
             return Err(WorkflowError::CorruptTask);
         }
         let error = if error_len > 0 {
-            Some(
-                String::from_utf8(bytes[cursor..cursor + error_len].to_vec())
-                    .map_err(|_| WorkflowError::CorruptTask)?,
-            )
+            // Validate UTF-8 on the borrowed view (no allocation),
+            // then slice the underlying buffer to refcount-share the
+            // bytes. `error_str()` re-creates the `&str` view at use
+            // time without re-validating because we already proved
+            // the bytes are UTF-8 here.
+            std::str::from_utf8(&bytes[cursor..cursor + error_len])
+                .map_err(|_| WorkflowError::CorruptTask)?;
+            Some(buf.slice(cursor..cursor + error_len))
         } else {
             None
         };
@@ -226,11 +246,14 @@ mod tests {
             created_nanos: 0,
             payload: bytes::Bytes::new(),
             result: None,
-            error: Some("boom".into()),
+            error: Some(bytes::Bytes::from_static(b"boom")),
         };
         let bytes = t.encode();
         let decoded = Task::decode(7, &bytes).unwrap();
-        assert_eq!(decoded.error.as_deref(), Some("boom"));
+        assert_eq!(
+            decoded.error_str().and_then(|r| r.ok()),
+            Some("boom")
+        );
     }
 
     #[test]

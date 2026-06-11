@@ -262,7 +262,13 @@ message TaskMessage {
   uint64 created_nanos = 4;
   bytes payload = 5;
   bytes result = 6;
-  string error = 7;
+  // UTF-8 bytes. Carried as `bytes` (decoded to `bytes::Bytes` by
+  // prost) so the broker→client read path stays refcount-only; the
+  // server validates UTF-8 once at engine-decode time, so any
+  // engine-produced error bytes are guaranteed to round-trip
+  // through a `String::from_utf8` on the consuming side without
+  // failure.
+  bytes error = 7;
 }
 
 message ListChildrenRequest {

@@ -1600,6 +1600,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "qx-broker",
+ "qx-workflow",
  "rcgen",
  "serde",
  "tempfile",

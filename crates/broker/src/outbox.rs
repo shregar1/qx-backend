@@ -34,11 +34,23 @@ pub fn spawn(broker: Arc<Broker>) {
                 match tokio::task::spawn_blocking(move || drain_all_outboxes(&bk)).await {
                     Ok(Ok(n)) => n,
                     Ok(Err(e)) => {
-                        eprintln!("outbox dispatcher: {e}");
+                        let msg = format!("outbox dispatcher: {e}");
+                        eprintln!("{msg}");
+                        broker.emit_event(
+                            crate::admin_api::EventLevel::Error,
+                            "outbox",
+                            msg,
+                        );
                         0
                     }
                     Err(e) => {
-                        eprintln!("outbox dispatcher join error: {e}");
+                        let msg = format!("outbox dispatcher join error: {e}");
+                        eprintln!("{msg}");
+                        broker.emit_event(
+                            crate::admin_api::EventLevel::Error,
+                            "outbox",
+                            msg,
+                        );
                         0
                     }
                 };
@@ -79,10 +91,12 @@ fn drain_all_outboxes(broker: &Broker) -> Result<usize> {
                 workflow.lock().unwrap().mark_emit_delivered(emit.emit_id)?;
                 total += 1;
             } else {
-                eprintln!(
+                let msg = format!(
                     "outbox: failed to deliver emit {} to {} (will retry)",
                     emit.emit_id, emit.target_topic
                 );
+                eprintln!("{msg}");
+                broker.emit_event(crate::admin_api::EventLevel::Warn, "outbox", msg);
             }
         }
     }

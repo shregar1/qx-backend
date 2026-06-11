@@ -95,6 +95,17 @@ pub struct BrokerConfig {
     /// tokio runtime wake latency dominates the CPU cache benefit.
     /// Bench it on your workload before enabling.
     pub per_core_shards: bool,
+    /// Default engine options applied to every `Engine` this broker
+    /// opens that does NOT have a per-name entry in
+    /// [`Self::workflow_overrides`]. `None` accepts the historical
+    /// engine defaults.
+    pub workflow_options: Option<qx_workflow::EngineOptions>,
+    /// Per-workflow-name engine options. A workflow whose name is in
+    /// this map opens its engine with the matching `EngineOptions`,
+    /// shadowing `workflow_options`. Lets operators run a "tiny-task"
+    /// workflow and a "big-blob" workflow off the same broker without
+    /// sizing the engine for the larger of the two.
+    pub workflow_overrides: HashMap<String, qx_workflow::EngineOptions>,
 }
 
 /// Single broker's view of a Raft-replicated cluster. Stored on
@@ -142,6 +153,22 @@ pub struct Broker {
     dir: PathBuf,
     topics: Mutex<HashMap<String, Arc<Topic>>>,
     workflows: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
+    /// Live (mutable) copy of the per-workflow overrides. Seeded from
+    /// `BrokerConfig::workflow_overrides` at open time; can be
+    /// replaced at runtime via [`Self::update_workflow_overrides`] —
+    /// qxd wires this to SIGHUP so operators can adjust per-workflow
+    /// engine sizing without a full broker restart.
+    workflow_overrides_live:
+        Mutex<HashMap<String, qx_workflow::EngineOptions>>,
+    /// Live (mutable) copy of the broker-wide default workflow
+    /// engine options. Mirrors `BrokerConfig::workflow_options`,
+    /// swappable at runtime via [`Self::update_workflow_defaults`].
+    workflow_defaults_live: Mutex<Option<qx_workflow::EngineOptions>>,
+    /// Live (mutable) bearer-token expected on incoming RPCs. The
+    /// per-request interceptor reads from this map under a `Mutex`
+    /// so SIGHUP can swap the token without restarting the gRPC
+    /// listener. `None` disables auth entirely.
+    live_auth_token: Mutex<Option<String>>,
     groups: Mutex<HashMap<GroupKey, SharedGroup>>,
     schemas: Mutex<Option<Arc<Registry>>>,
     triggers: Mutex<HashMap<String, crate::triggers::TriggerHandle>>,
@@ -187,6 +214,11 @@ pub struct Broker {
     /// deltas across requests.
     topic_produce_metrics:
         Mutex<HashMap<String, Arc<crate::admin_api::TopicMetricCounters>>>,
+    /// Bounded ring of recent structured events surfaced through
+    /// `/api/events`. Capacity is fixed at construction; new events
+    /// evict the oldest. Cheap — Mutex<VecDeque>, only touched at
+    /// lifecycle / error boundaries plus from the read path.
+    event_ring: Arc<crate::admin_api::EventRing>,
     /// ACL store backing CreateAcls / DeleteAcls / DescribeAcls and the
     /// per-request authorization gate. In-memory; starts empty (all
     /// requests allowed) until an operator creates the first ACL, at
@@ -307,10 +339,16 @@ impl Broker {
             }
         }
 
-        Arc::new(Self {
+        let overrides_seed = config.workflow_overrides.clone();
+        let defaults_seed = config.workflow_options.clone();
+        let auth_seed = config.auth_token.clone();
+        let broker = Arc::new(Self {
             dir,
             topics: Mutex::new(topics_map),
             workflows: Mutex::new(HashMap::new()),
+            workflow_overrides_live: Mutex::new(overrides_seed),
+            workflow_defaults_live: Mutex::new(defaults_seed),
+            live_auth_token: Mutex::new(auth_seed),
             groups: Mutex::new(HashMap::new()),
             schemas: Mutex::new(None),
             triggers: Mutex::new(HashMap::new()),
@@ -324,6 +362,7 @@ impl Broker {
             txn_registry,
             started_at: std::time::Instant::now(),
             topic_produce_metrics: Mutex::new(HashMap::new()),
+            event_ring: Arc::new(crate::admin_api::EventRing::with_capacity(256)),
             acls: Arc::new(crate::kafka::acls::AclStore::new()),
             // Per-core sharded writes are now an explicit opt-in via
             // `BrokerConfig::per_core_shards` rather than tied to
@@ -346,13 +385,46 @@ impl Broker {
             peer_clients: Mutex::new(HashMap::new()),
             grpc_cluster_for_snapshot: std::sync::OnceLock::new(),
             config,
-        })
+        });
+        // Boot-time event so the dashboard's events panel never
+        // shows "no events" once qxd is healthy. Cheap — one
+        // ring push.
+        broker.emit_event(
+            crate::admin_api::EventLevel::Info,
+            "broker",
+            format!(
+                "broker started in {:?} mode ({})",
+                broker.config.mode,
+                if broker.config.cluster.is_some() {
+                    "cluster"
+                } else {
+                    "single-node"
+                }
+            ),
+        );
+        broker
     }
 
     /// Wall-clock seconds since `open_with_config` returned. Used
     /// by `/api/health` and `/api/nodes` for the dashboard.
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Append one event to the broker's `/api/events` ring. Cheap:
+    /// one Mutex acquire, one VecDeque push, possibly one pop_front
+    /// when at capacity. Source strings are short, fixed labels (the
+    /// emitting subsystem); messages are caller-formatted. Safe to
+    /// call from any thread, including background tasks.
+    pub fn emit_event(&self, level: crate::admin_api::EventLevel, source: &str, message: String) {
+        self.event_ring.push(level, source, message);
+    }
+
+    /// Current ring contents, oldest first. Cloned out under the
+    /// lock so the admin response can be serialized without the
+    /// ring open.
+    pub fn events_snapshot(&self) -> Vec<crate::admin_api::EventLine> {
+        self.event_ring.snapshot()
     }
 
     /// Bump per-topic Produce counters. Called once per successful
@@ -957,6 +1029,112 @@ impl Broker {
             .cloned()
     }
 
+    /// Replace the bearer token the gRPC interceptor expects on
+    /// every incoming RPC. `None` disables auth. qxd wires this to
+    /// SIGHUP so operators can rotate tokens without restarting the
+    /// gRPC listener. Existing in-flight RPCs are not retroactively
+    /// re-checked; the next RPC on any stream is checked against
+    /// the new token.
+    pub fn update_auth_token(&self, token: Option<String>) {
+        *self.live_auth_token.lock().unwrap() = token;
+    }
+
+    /// Replace the broker-wide default `EngineOptions` used when a
+    /// workflow has no per-name override. Workflows whose engines
+    /// are already cached keep their current engine until either
+    /// `update_workflow_overrides` evicts them or the broker
+    /// restarts. Per-workflow overrides always take precedence over
+    /// this default at engine-open time.
+    pub fn update_workflow_defaults(
+        &self,
+        defaults: Option<qx_workflow::EngineOptions>,
+    ) {
+        *self.workflow_defaults_live.lock().unwrap() = defaults;
+    }
+
+    /// Best-effort eager reopen of a workflow engine that was just
+    /// evicted by [`Self::update_workflow_overrides`] (typically
+    /// invoked by qxd's SIGHUP handler right after the swap).
+    /// Returns `true` when the engine reopened; `false` when redb's
+    /// per-file lock refuses a second instance because an in-flight
+    /// caller still holds the prior `Arc<Mutex<Engine>>`. A `false`
+    /// is not an error — the next normal call to
+    /// `get_or_open_workflow` will retry once the prior holder
+    /// drops their reference.
+    pub fn warm_workflow(&self, name: &str) -> bool {
+        self.get_or_open_workflow(name).is_ok()
+    }
+
+    /// Swap the live per-workflow `EngineOptions` overrides.
+    ///
+    /// Workflows whose options actually changed have their cached
+    /// `Engine` handle dropped from this broker — the next call to
+    /// [`Self::get_or_open_workflow`] will re-open the on-disk engine
+    /// with the new options. In-flight callers that already hold an
+    /// `Arc<Mutex<Engine>>` to the old handle continue against the
+    /// old engine until they release their `Arc`; new callers see the
+    /// new one. This avoids stalling outstanding redb transactions.
+    ///
+    /// Returns the set of workflow names whose cached engine was
+    /// dropped — qxd logs this so operators can see what the SIGHUP
+    /// reload touched.
+    pub fn update_workflow_overrides(
+        &self,
+        new_overrides: HashMap<String, qx_workflow::EngineOptions>,
+    ) -> Vec<String> {
+        let mut changed: Vec<String> = Vec::new();
+        {
+            let mut live = self.workflow_overrides_live.lock().unwrap();
+            // Walk both the union of old + new keys so we catch both
+            // additions/edits AND removals (override taken away → the
+            // engine reopens with the broker-wide default).
+            let all_names: std::collections::HashSet<String> =
+                live.keys().chain(new_overrides.keys()).cloned().collect();
+            for name in all_names {
+                let before = live.get(&name);
+                let after = new_overrides.get(&name);
+                let same = match (before, after) {
+                    (Some(a), Some(b)) => a.encode_buf_capacity == b.encode_buf_capacity
+                        && a.cancel_max_descendants == b.cancel_max_descendants
+                        && a.redb_cache_bytes == b.redb_cache_bytes,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    changed.push(name);
+                }
+            }
+            *live = new_overrides;
+        }
+        if !changed.is_empty() {
+            let mut wfs = self.workflows.lock().unwrap();
+            for name in &changed {
+                wfs.remove(name);
+            }
+        }
+        changed
+    }
+
+    /// Test-only public alias for `get_or_open_workflow`. Lets the
+    /// `workflow_overrides_hot_swap` integration test observe the
+    /// cached `Arc<Mutex<Engine>>` identity before and after a
+    /// `update_workflow_overrides` call.
+    pub fn get_or_open_workflow_for_test(
+        &self,
+        name: &str,
+    ) -> Result<Arc<Mutex<Engine>>> {
+        self.get_or_open_workflow(name)
+    }
+
+    /// Test-only check: is this workflow's engine currently in the
+    /// broker's open-engines cache? After
+    /// `update_workflow_overrides` drops a changed workflow, this
+    /// returns `false` until the next `get_or_open_workflow` reopens
+    /// the engine with the new options.
+    pub fn workflow_is_cached_for_test(&self, name: &str) -> bool {
+        self.workflows.lock().unwrap().contains_key(name)
+    }
+
     pub(crate) fn get_or_open_workflow(&self, name: &str) -> Result<Arc<Mutex<Engine>>> {
         let mut wfs = self.workflows.lock().unwrap();
         if let Some(arc) = wfs.get(name) {
@@ -965,7 +1143,26 @@ impl Broker {
         let dir = self.dir.join("workflows");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{name}.redb"));
-        let engine = Engine::open(path)?;
+        // Per-workflow override takes precedence over the broker's
+        // default `workflow_options`; both fall back to the historical
+        // `Engine::open` shape when nothing is configured. The live
+        // overrides map can be mutated at runtime via
+        // [`Self::update_workflow_overrides`] (qxd wires that to
+        // SIGHUP), so we read it once here for this open and capture
+        // the chosen options.
+        let live_override = self
+            .workflow_overrides_live
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned();
+        let engine = if let Some(opts) = live_override {
+            qx_workflow::Engine::with_options(path, opts)?
+        } else if let Some(opts) = self.workflow_defaults_live.lock().unwrap().clone() {
+            qx_workflow::Engine::with_options(path, opts)?
+        } else {
+            Engine::open(path)?
+        };
         let arc = Arc::new(Mutex::new(engine));
         wfs.insert(name.to_string(), arc.clone());
         Ok(arc)
@@ -983,10 +1180,15 @@ impl Broker {
         let svc = BrokerSvc {
             broker: self.clone(),
         };
-        let expected_token = self.config.auth_token.clone();
+        // Capture an `Arc<Broker>` so the interceptor reads the
+        // live token on each request. SIGHUP-driven swaps land
+        // through `Broker::update_auth_token` without restarting
+        // the listener.
+        let broker_for_auth = self.clone();
         #[allow(clippy::result_large_err)]
         let interceptor = move |req: tonic::Request<()>| -> std::result::Result<tonic::Request<()>, Status> {
-            check_auth(&expected_token, &req)?;
+            let expected = broker_for_auth.live_auth_token.lock().unwrap().clone();
+            check_auth(&expected, &req)?;
             Ok(req)
         };
         let stream = TcpListenerStream::new(listener);
@@ -1070,6 +1272,12 @@ impl Broker {
         let topic = Topic::open(&dir, cfg)?;
         let count = topic.partition_count();
         topics.insert(name.to_string(), Arc::new(topic));
+        drop(topics);
+        self.emit_event(
+            crate::admin_api::EventLevel::Info,
+            "topic",
+            format!("topic '{name}' opened with {count} partition(s)"),
+        );
         Ok(count)
     }
 
@@ -1100,6 +1308,11 @@ impl Broker {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
+        self.emit_event(
+            crate::admin_api::EventLevel::Info,
+            "topic",
+            format!("topic '{name}' deleted"),
+        );
         Ok(true)
     }
 
@@ -2410,6 +2623,11 @@ fn task_to_proto(t: Task) -> proto::TaskMessage {
         created_nanos: t.created_nanos,
         payload: t.payload,
         result: t.result.unwrap_or_default(),
+        // proto::TaskMessage.error is now `bytes::Bytes` thanks to the
+        // build.rs codegen tweak — refcount-shared straight through
+        // from qx-workflow's `Task::error` to the wire. UTF-8 is
+        // validated once at engine decode time so consumers can
+        // `String::from_utf8` on the bytes safely.
         error: t.error.unwrap_or_default(),
     }
 }

@@ -141,6 +141,7 @@ impl Broker {
                 accept = listener.accept() => {
                     let (stream, peer) = accept?;
                     let broker = self.clone();
+                    let broker_for_log = broker.clone();
                     let config = config.clone();
                     let conn_shutdown = self.shutdown_token();
                     let acceptor = tls_acceptor.clone();
@@ -158,7 +159,13 @@ impl Broker {
                             },
                         };
                         if let Err(e) = result {
-                            eprintln!("kafka: connection from {peer} ended: {e}");
+                            let msg = format!("kafka: connection from {peer} ended: {e}");
+                            eprintln!("{msg}");
+                            broker_for_log.emit_event(
+                                crate::admin_api::EventLevel::Warn,
+                                "kafka",
+                                msg,
+                            );
                         }
                     });
                 }
@@ -316,7 +323,13 @@ where
         let response = match dispatch(&broker, &config, &mut state, frame).await {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("kafka: malformed frame: {e}");
+                let msg = format!("kafka: malformed frame: {e}");
+                eprintln!("{msg}");
+                broker.emit_event(
+                    crate::admin_api::EventLevel::Error,
+                    "kafka",
+                    msg,
+                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     e.to_string(),

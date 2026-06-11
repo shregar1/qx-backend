@@ -29,7 +29,11 @@ pub fn spawn(broker: Arc<Broker>) {
                 .await
                 .unwrap_or(0);
             if aborted > 0 {
-                eprintln!("txn sweeper: auto-aborted {aborted} expired transaction(s)");
+                let msg = format!(
+                    "txn sweeper: auto-aborted {aborted} expired transaction(s)"
+                );
+                eprintln!("{msg}");
+                broker.emit_event(crate::admin_api::EventLevel::Warn, "txn", msg);
             }
             tokio::select! {
                 _ = shutdown.changed() => return,
