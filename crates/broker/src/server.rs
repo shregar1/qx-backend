@@ -1135,6 +1135,13 @@ impl Broker {
         self.workflows.lock().unwrap().contains_key(name)
     }
 
+    /// Test-only peek at the currently-live auth token. Used by the
+    /// `live_runtime_knobs` test to confirm `update_auth_token`
+    /// actually mutated the value the interceptor reads from.
+    pub fn live_auth_token_for_test(&self) -> Option<String> {
+        self.live_auth_token.lock().unwrap().clone()
+    }
+
     pub(crate) fn get_or_open_workflow(&self, name: &str) -> Result<Arc<Mutex<Engine>>> {
         let mut wfs = self.workflows.lock().unwrap();
         if let Some(arc) = wfs.get(name) {
@@ -2703,34 +2710,59 @@ async fn handle_metrics_connection(
     let method = iter.next().unwrap_or("");
     let path = iter.next().unwrap_or("");
 
-    // CORS preflight: blanket permissive. The admin API is read-
-    // only; the dev dashboard at vite :5173 needs OPTIONS to clear.
+    // CORS preflight: blanket permissive. Needed for `npm run dev`
+    // against this broker; browsers loading the embedded dashboard
+    // skip preflight because every request is same-origin.
     if method == "OPTIONS" {
-        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Max-Age: 600\r\nConnection: close\r\n\r\n";
-        stream.write_all(response.as_bytes()).await?;
+        let response = b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Max-Age: 600\r\nConnection: close\r\n\r\n";
+        stream.write_all(response).await?;
         stream.shutdown().await?;
         return Ok(());
     }
 
-    // Route. /metrics keeps its prior Prometheus contract; /api/*
-    // is the dashboard JSON surface; everything else 404s.
-    let (status, content_type, body) = if path == "/metrics" || path == "/" {
-        let body = match broker.all_stats() {
-            Ok(stats) => format_metrics(&stats),
-            Err(e) => format!("# error: {e}\n"),
+    // Route. Order matters: `/metrics` and `/api/*` must be checked
+    // before the SPA fallback so the dashboard shell can't swallow
+    // API requests.
+    let (status, content_type, body): (&'static str, &'static str, Vec<u8>) =
+        if path == "/metrics" {
+            let s = match broker.all_stats() {
+                Ok(stats) => format_metrics(&stats),
+                Err(e) => format!("# error: {e}\n"),
+            };
+            ("200 OK", "text/plain; version=0.0.4; charset=utf-8", s.into_bytes())
+        } else if let Some(json) = crate::admin_api::render_route(path, &broker).await {
+            ("200 OK", "application/json", json.into_bytes())
+        } else if let Some((ct, bytes)) = crate::dashboard_assets::render_path(path) {
+            // Hashed assets + index.html + SPA fallback. Bytes
+            // borrowed from the compile-time embed; copy into the
+            // response so the stream owns its buffer.
+            ("200 OK", ct, bytes.to_vec())
+        } else if path == "/" && crate::dashboard_assets::is_empty() {
+            // Operator built qxd without dropping the dashboard
+            // dist into `static/dashboard/`. Keep the legacy
+            // "Prometheus at root" behaviour so existing scrapers
+            // pointed at `/` keep working.
+            let s = match broker.all_stats() {
+                Ok(stats) => format_metrics(&stats),
+                Err(e) => format!("# error: {e}\n"),
+            };
+            ("200 OK", "text/plain; version=0.0.4; charset=utf-8", s.into_bytes())
+        } else {
+            (
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found\n".to_vec(),
+            )
         };
-        ("200 OK", "text/plain; version=0.0.4; charset=utf-8", body)
-    } else if let Some(json) = crate::admin_api::render_route(path, &broker).await {
-        ("200 OK", "application/json", json)
-    } else {
-        ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string())
-    };
 
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+    // Send the head as text, then the body bytes. Binary-clean —
+    // fonts and any other non-UTF8 asset flow through untouched.
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(&body).await?;
     stream.shutdown().await?;
     Ok(())
 }

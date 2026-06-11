@@ -6,6 +6,7 @@
 
 pub mod admin_api;
 mod client;
+mod dashboard_assets;
 mod error;
 mod groups;
 mod kafka;
