@@ -49,7 +49,7 @@ key_file = "{key}"
     write_file(&config_path, config_text.as_bytes()).await;
 
     // 3. Spawn qxd as a subprocess.
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qxd"))
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qx"))
         .arg("--config")
         .arg(&config_path)
         .stdout(Stdio::piped())

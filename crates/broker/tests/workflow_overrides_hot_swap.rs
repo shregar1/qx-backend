@@ -12,7 +12,6 @@
 //!      were dropped, so qxd can log a meaningful summary.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use qx_broker::{Broker, BrokerConfig};
 use tempfile::TempDir;

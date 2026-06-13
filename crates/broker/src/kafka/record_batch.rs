@@ -36,7 +36,7 @@
 //! Only uncompressed batches are accepted today; compressed batches return
 //! a `Compressed` error so the caller can surface the right Kafka error code.
 
-use super::codec::{Reader, WireError, WireResult};
+use super::codec::{Reader, WireError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BatchError {

@@ -287,7 +287,7 @@ async fn reserve_ports(n: usize) -> (Vec<u16>, Vec<u16>) {
 }
 
 async fn spawn_qxd(config_path: &std::path::Path) -> tokio::process::Child {
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_qxd"))
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_qx"))
         .arg("--config")
         .arg(config_path)
         .stdout(Stdio::piped())

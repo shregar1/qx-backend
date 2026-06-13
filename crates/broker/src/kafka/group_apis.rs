@@ -12,8 +12,8 @@ use tokio::sync::oneshot;
 use super::codec::{Reader, WireResult, Writer};
 use super::error_codes;
 use super::group_coordinator::{
-    DescribeRequest, GroupMsg, HeartbeatRequest, JoinMember, JoinRequest, JoinResponse,
-    LeaveRequest, OffsetCommitRequest, OffsetFetchRequest, SyncRequest,
+    DescribeRequest, GroupMsg, HeartbeatRequest, JoinRequest, JoinResponse, LeaveRequest,
+    OffsetCommitRequest, OffsetFetchRequest, SyncRequest,
 };
 use crate::server::Broker;
 

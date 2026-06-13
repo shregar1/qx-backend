@@ -43,6 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".qx.v1.CompleteTaskWithEmitsRequest.result",
             ".qx.v1.TopicEmit.payload",
         ])
-        .compile(&["proto/qx.proto"], &["proto"])?;
+        .compile_protos(&["proto/qx.proto"], &["proto"])?;
     Ok(())
 }

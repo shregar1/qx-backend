@@ -408,14 +408,74 @@ impl GrpcCluster {
                 // already initialized. Match on the error string —
                 // openraft 0.9 doesn't expose a stable error kind
                 // for this path.
+                // openraft phrases this several different ways across
+                // versions:
+                //   - "NotAllowed"
+                //   - "not allowed to initialize"
+                //   - "log not empty"  / "already initialized"
+                // All of them mean "this node already has cluster
+                // state on disk, just rejoin" — which is exactly the
+                // correct behaviour after a kill + restart, so we
+                // treat any of them as success instead of bailing.
                 let s = e.to_string();
-                if s.contains("NotAllowed") || s.contains("already") {
+                let already = ["NotAllowed", "not allowed", "already", "log not empty"]
+                    .iter()
+                    .any(|n| s.contains(n));
+                if already {
                     Ok(())
                 } else {
                     Err(RaftError::Initialise(s))
                 }
             }
         }
+    }
+
+    /// Replace the cluster's voter set with `voters`. Must be called
+    /// on the *leader* — followers return a `change_membership`
+    /// error surfacing openraft's `ForwardToLeader` rejection.
+    ///
+    /// Each node id in `voters` that the leader doesn't already
+    /// know is first added as a *non-blocking learner* so openraft
+    /// has a routing entry for it. We then submit a single
+    /// `ReplaceAllVoters` change; openraft enforces the joint-
+    /// consensus protocol internally. Brand-new voters that aren't
+    /// running yet will keep the call pending until they come
+    /// online and catch up — operators should bring up the new
+    /// nodes *before* issuing this on the leader.
+    ///
+    /// Removed voters are demoted/removed by the same atomic
+    /// change. This API does not stop the removed broker's
+    /// process; the operator handles that separately.
+    pub async fn change_membership(
+        &self,
+        voters: std::collections::BTreeSet<NodeId>,
+    ) -> Result<()> {
+        assert_eq!(
+            self.nodes.len(),
+            1,
+            "change_membership called on a multi-node bootstrap"
+        );
+        let raft = &self.nodes[0].raft;
+
+        // Step 1: ensure every voter is at least registered with the
+        // leader's routing table. add_learner is idempotent in
+        // openraft 0.9 — pre-existing entries return an "already
+        // exists" error which we swallow.
+        for &id in &voters {
+            if let Err(e) = raft.add_learner(id, BasicNode::default(), false).await {
+                let s = e.to_string();
+                if !s.contains("already") && !s.contains("Already") {
+                    eprintln!("qx-raft: add_learner({id}) failed: {s}");
+                }
+            }
+        }
+
+        // Step 2: atomic membership replacement.
+        let members = openraft::ChangeMembers::ReplaceAllVoters(voters);
+        raft.change_membership(members, false)
+            .await
+            .map(|_| ())
+            .map_err(|e| RaftError::ChangeMembership(e.to_string()))
     }
 
     /// Wait until any node in this single-node view knows of a Raft
@@ -447,6 +507,18 @@ impl GrpcCluster {
             }
         }
         None
+    }
+
+    /// Snapshot of openraft's local-node metrics — `(term,
+    /// last_log_index, last_applied, current_leader)`. Used by the
+    /// broker's `/api/nodes` handler to surface real Raft state
+    /// instead of hardcoded zeros.
+    pub fn local_metrics(&self) -> Option<(u64, u64, u64, Option<NodeId>)> {
+        let node = self.nodes.first()?;
+        let m = node.raft.metrics().borrow().clone();
+        let last_log = m.last_log_index.unwrap_or(0);
+        let last_applied = m.last_applied.map(|l| l.index).unwrap_or(0);
+        Some((m.current_term, last_log, last_applied, m.current_leader))
     }
 
     pub async fn append(&self, payload: Vec<u8>) -> Result<u64> {

@@ -218,27 +218,48 @@ fn rate_cache() -> &'static RateCache {
 pub fn nodes_snapshot(broker: &Broker) -> Vec<NodeStat> {
     let uptime = broker.uptime_seconds();
     let my_id = broker.cluster_node_id().unwrap_or(0);
+
+    // Pull real openraft metrics for the local row — term,
+    // commit_index, last_applied, and the leader id so we can mark
+    // self as "leader" vs "follower" correctly. Single-node /
+    // single-broker setups (no cluster configured) keep the prior
+    // hardcoded shape since openraft isn't booted.
+    let (term, commit_index, last_applied, leader_id) =
+        broker.raft_metrics().unwrap_or((0, 0, 0, Some(my_id)));
+    let my_role: &'static str = match leader_id {
+        Some(id) if id == my_id => "leader",
+        Some(_) => "follower",
+        None => "candidate",
+    };
+
     let mut out = vec![NodeStat {
         id: my_id,
         addr: broker
             .advertised_addr()
             .unwrap_or_else(|| "self".to_string()),
-        role: "leader",
+        role: my_role,
         status: "healthy",
-        term: 0,
-        commit_index: 0,
-        last_applied: 0,
+        term,
+        commit_index,
+        last_applied,
         uptime_seconds: uptime,
     }];
     for peer in broker.peer_addrs() {
+        let peer_role = match leader_id {
+            Some(id) if id == peer.0 => "leader",
+            _ => "follower",
+        };
         out.push(NodeStat {
             id: peer.0,
             addr: peer.1,
-            role: "follower",
+            role: peer_role,
+            // Peer reachability isn't probed here yet — assume
+            // healthy. A future enhancement could TCP-probe the
+            // peer addr and flip to "down" on connect failure.
             status: "healthy",
-            term: 0,
-            commit_index: 0,
-            last_applied: 0,
+            term,
+            commit_index,
+            last_applied,
             uptime_seconds: 0,
         });
     }
@@ -246,10 +267,15 @@ pub fn nodes_snapshot(broker: &Broker) -> Vec<NodeStat> {
 }
 
 pub fn topics_snapshot(broker: &Broker) -> Vec<TopicStat> {
-    let stats = match broker.all_stats() {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    // Read the background-refreshed cache instead of calling
+    // `all_stats()` here. `all_stats()` locks every partition's
+    // queue mutex — under heavy producer load (1k+ concurrent
+    // sends) that lock is essentially never free, and /api/topics
+    // would time out. The cache is refreshed once per second by a
+    // task spawned in `Broker::open_with_config`; stats are at
+    // most ~1s stale, comfortably inside the dashboard's 2s
+    // polling window.
+    let stats = broker.cached_topic_stats();
     // Index running totals once so we don't lock per-topic.
     let totals: HashMap<String, (u64, u64)> = broker
         .topic_metric_totals()
@@ -355,8 +381,11 @@ pub async fn groups_snapshot(broker: &Broker) -> Vec<GroupStat> {
 }
 
 pub fn workflows_snapshot(broker: &Broker) -> Vec<WorkflowStat> {
+    // Background-cached read — see `topics_snapshot` for the
+    // rationale. Direct `workflow_stats()` here would queue
+    // behind the engine mutex held during create/complete/cancel.
     broker
-        .workflow_stats()
+        .cached_workflow_stats()
         .into_iter()
         .map(|(name, stats)| WorkflowStat {
             name,

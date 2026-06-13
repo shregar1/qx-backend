@@ -428,7 +428,7 @@ async fn two_members_complete_rebalance_together() {
         }
     });
 
-    let ((join_a_resp, mut stream_a), (join_b_resp, mut stream_b)) =
+    let ((join_a_resp, stream_a), (join_b_resp, stream_b)) =
         tokio::try_join!(join_a, join_b).unwrap();
 
     assert_eq!(join_a_resp.error_code, 0, "A JoinGroup err {}", join_a_resp.error_code);

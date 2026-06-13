@@ -81,7 +81,7 @@ node_id = {id}
     // children that will rebind them.
     drop(reservations);
     for config_path in &config_paths {
-        let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qxd"))
+        let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qx"))
             .arg("--config")
             .arg(config_path)
             .stdout(Stdio::piped())

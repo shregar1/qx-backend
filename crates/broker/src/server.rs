@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use qx_queue::{QueueConfig, ReceiptHandle};
 use qx_storage::PartitionConfig;
 use qx_topic::{Topic, TopicConfig, TopicError, TopicReceipt};
@@ -47,9 +49,16 @@ pub enum BrokerMode {
     Hyper,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct BrokerConfig {
     pub auth_token: Option<String>,
+    /// Keyx validator — when configured, every authenticated RPC's
+    /// bearer is run through `validate()` (with a small per-key
+    /// TTL cache) before reaching the handler. The local
+    /// `auth_token` still works as a *fallback* when keyx is
+    /// unreachable, so a network partition doesn't lock the
+    /// operator out of their own broker.
+    pub keyx_validator: Option<Arc<crate::auth_keyx::KeyxValidator>>,
     pub tls: Option<TlsConfig>,
     /// Selects which broker profile to run. `Standard` (default) is
     /// the portable, single-runtime path. `Hyper` enables zero-copy
@@ -149,10 +158,41 @@ pub struct TlsConfig {
 type GroupKey = (String, String);
 type SharedGroup = Arc<Mutex<crate::groups::ConsumerGroup>>;
 
+/// Cached workflow engine plus the provenance of the options it
+/// was opened with. We need provenance so `update_workflow_defaults`
+/// can evict only engines that opened under the broker default
+/// (those are the only ones whose configuration the default-swap
+/// would change). Engines opened under a per-workflow override are
+/// unaffected by default changes and stay in the cache.
+struct WorkflowEntry {
+    engine: Arc<Mutex<Engine>>,
+    /// `true` when this engine was opened against a `[[workflow.override]]`
+    /// entry; `false` when it fell back to the broker-wide default.
+    used_override: bool,
+}
+
 pub struct Broker {
     dir: PathBuf,
     topics: Mutex<HashMap<String, Arc<Topic>>>,
-    workflows: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
+    /// Background-refreshed snapshot of `(name, TopicStats)` for
+    /// every topic. `/api/topics` reads from here instead of
+    /// calling `Topic::stats()` directly, which would queue behind
+    /// the per-partition `Mutex<Queue>` the producer holds during
+    /// each redb commit. Refreshed ~1×/s by a task spawned in
+    /// `open_with_config`. Stale by at most ~1s; that's well
+    /// within the dashboard's 2s polling window.
+    topic_stats_cache: Arc<Mutex<Vec<(String, qx_topic::TopicStats)>>>,
+    /// Same pattern for workflows — `Engine::stats()` takes the
+    /// per-engine mutex the producer holds during redb work on
+    /// `create_root_task` / `complete_task` / `cancel_task`. Under
+    /// heavy workflow churn the direct call livelocks
+    /// `/api/workflows` exactly like the topics case used to.
+    workflow_stats_cache: Arc<Mutex<Vec<(String, qx_workflow::EngineStats)>>>,
+    /// Workflow engine cache. Each entry remembers whether the
+    /// engine was opened under a per-workflow override or under the
+    /// broker-wide default — when defaults change we evict only the
+    /// default-using engines.
+    workflows: Mutex<HashMap<String, WorkflowEntry>>,
     /// Live (mutable) copy of the per-workflow overrides. Seeded from
     /// `BrokerConfig::workflow_overrides` at open time; can be
     /// replaced at runtime via [`Self::update_workflow_overrides`] —
@@ -161,14 +201,33 @@ pub struct Broker {
     workflow_overrides_live:
         Mutex<HashMap<String, qx_workflow::EngineOptions>>,
     /// Live (mutable) copy of the broker-wide default workflow
-    /// engine options. Mirrors `BrokerConfig::workflow_options`,
-    /// swappable at runtime via [`Self::update_workflow_defaults`].
-    workflow_defaults_live: Mutex<Option<qx_workflow::EngineOptions>>,
-    /// Live (mutable) bearer-token expected on incoming RPCs. The
-    /// per-request interceptor reads from this map under a `Mutex`
-    /// so SIGHUP can swap the token without restarting the gRPC
-    /// listener. `None` disables auth entirely.
-    live_auth_token: Mutex<Option<String>>,
+    /// engine options. Reads on the engine-open path are lock-free
+    /// via [`arc_swap::ArcSwap`]; the typical workflow open hits this
+    /// once per call. `update_workflow_defaults` swaps the value
+    /// atomically.
+    workflow_defaults_live: ArcSwap<Option<qx_workflow::EngineOptions>>,
+    /// Live (mutable) bearer-token expected on incoming RPCs.
+    /// Reads on the gRPC interceptor hot path are lock-free via
+    /// [`arc_swap::ArcSwap`] — every authenticated RPC does a single
+    /// `load_full()` instead of taking a mutex. `update_auth_token`
+    /// swaps the value atomically. `None` disables auth entirely.
+    live_auth_token: ArcSwap<Option<String>>,
+    /// Live (mutable) keyx validator. Same swap pattern as the auth
+    /// token — qx's SIGHUP handler can re-point at a different
+    /// keyx base URL or flush the cache without a restart. `None`
+    /// disables the keyx round-trip; the bearer is then compared
+    /// against `live_auth_token` only (legacy behaviour).
+    live_keyx: ArcSwap<Option<Arc<crate::auth_keyx::KeyxValidator>>>,
+    /// Live (mutable) TLS server configuration. `None` when the
+    /// broker started without TLS — in that case it stays `None`
+    /// for the lifetime of the broker (enabling TLS mid-run
+    /// requires rebinding the listener, which is restart-only).
+    /// When `Some`, the gRPC listener uses a custom acceptor
+    /// driven by this `ArcSwap`; `update_tls` swaps cert/key
+    /// atomically and *new* TCP connections handshake with the
+    /// fresh `ServerConfig`. Existing TLS sessions stay on the
+    /// keys they handshook with.
+    live_tls: ArcSwap<Option<Arc<tokio_rustls::rustls::ServerConfig>>>,
     groups: Mutex<HashMap<GroupKey, SharedGroup>>,
     schemas: Mutex<Option<Arc<Registry>>>,
     triggers: Mutex<HashMap<String, crate::triggers::TriggerHandle>>,
@@ -342,13 +401,32 @@ impl Broker {
         let overrides_seed = config.workflow_overrides.clone();
         let defaults_seed = config.workflow_options.clone();
         let auth_seed = config.auth_token.clone();
+        // Build the rustls server config up front so a malformed
+        // PEM rejects at startup rather than at first connect. We
+        // panic here because (a) Broker::open* historically
+        // doesn't return Result, and (b) qxd should fail loud and
+        // early if its TLS material is broken. We set ALPN to h2
+        // (HTTP/2) here because the gRPC listener uses this seed —
+        // without it tonic's h2 transport rejects the connection
+        // with "H2NotNegotiated".
+        let tls_seed: Option<Arc<tokio_rustls::rustls::ServerConfig>> =
+            config.tls.as_ref().map(|tls| {
+                let mut cfg = build_tls_server_config(tls)
+                    .expect("TLS material in BrokerConfig must parse at open time");
+                cfg.alpn_protocols = vec![b"h2".to_vec()];
+                Arc::new(cfg)
+            });
         let broker = Arc::new(Self {
             dir,
             topics: Mutex::new(topics_map),
+            topic_stats_cache: Arc::new(Mutex::new(Vec::new())),
+            workflow_stats_cache: Arc::new(Mutex::new(Vec::new())),
             workflows: Mutex::new(HashMap::new()),
             workflow_overrides_live: Mutex::new(overrides_seed),
-            workflow_defaults_live: Mutex::new(defaults_seed),
-            live_auth_token: Mutex::new(auth_seed),
+            workflow_defaults_live: ArcSwap::from_pointee(defaults_seed),
+            live_auth_token: ArcSwap::from_pointee(auth_seed),
+            live_keyx: ArcSwap::from_pointee(config.keyx_validator.clone()),
+            live_tls: ArcSwap::from_pointee(tls_seed),
             groups: Mutex::new(HashMap::new()),
             schemas: Mutex::new(None),
             triggers: Mutex::new(HashMap::new()),
@@ -386,6 +464,56 @@ impl Broker {
             grpc_cluster_for_snapshot: std::sync::OnceLock::new(),
             config,
         });
+        // Spawn the topic-stats cache refresher. It calls
+        // `all_stats()` once per second and writes the result into
+        // `topic_stats_cache` so `/api/topics` never has to take
+        // the per-partition queue lock the producer holds during
+        // each redb commit. Without this, the dashboard goes blank
+        // under heavy producer load (root cause of the stress-test
+        // BUG #1 livelock).
+        {
+            let broker_for_refresh = broker.clone();
+            let handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                loop {
+                    tick.tick().await;
+                    if *broker_for_refresh.shutdown_tx.borrow() {
+                        return;
+                    }
+                    // Compute in a blocking task so the redb read
+                    // doesn't park a tokio worker.
+                    let b = broker_for_refresh.clone();
+                    let result =
+                        tokio::task::spawn_blocking(move || b.all_stats())
+                            .await;
+                    if let Ok(Ok(stats)) = result {
+                        *broker_for_refresh
+                            .topic_stats_cache
+                            .lock()
+                            .unwrap() = stats;
+                    }
+                    // Same idea for workflows — the read takes the
+                    // engine mutex briefly; the producer's
+                    // create/complete/cancel paths also hold it.
+                    let b2 = broker_for_refresh.clone();
+                    let wf_result = tokio::task::spawn_blocking(move || {
+                        b2.workflow_stats()
+                    })
+                    .await;
+                    if let Ok(stats) = wf_result {
+                        *broker_for_refresh
+                            .workflow_stats_cache
+                            .lock()
+                            .unwrap() = stats;
+                    }
+                }
+            });
+            broker.background_handles.lock().unwrap().push(handle);
+        }
+
         // Boot-time event so the dashboard's events panel never
         // shows "no events" once qxd is healthy. Cheap — one
         // ring push.
@@ -541,7 +669,10 @@ impl Broker {
     pub fn workflow_stats(&self) -> Vec<(String, qx_workflow::EngineStats)> {
         let snaps: Vec<(String, Arc<Mutex<qx_workflow::Engine>>)> = {
             let workflows = self.workflows.lock().unwrap();
-            workflows.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            workflows
+                .iter()
+                .map(|(k, v)| (k.clone(), v.engine.clone()))
+                .collect()
         };
         snaps
             .into_iter()
@@ -583,6 +714,42 @@ impl Broker {
     /// Return this broker's `NodeId` if cluster mode is configured.
     pub fn cluster_node_id(&self) -> Option<u64> {
         self.config.cluster.as_ref().map(|c| c.node_id)
+    }
+
+    /// Snapshot of openraft's local-node metrics —
+    /// `(term, commit_index, last_applied, current_leader)`. Used
+    /// by `/api/nodes` so the dashboard shows real Raft state
+    /// instead of the historical hardcoded zeros. Returns `None`
+    /// in single-node mode where the openraft instance isn't
+    /// booted.
+    pub fn raft_metrics(&self) -> Option<(u64, u64, u64, Option<u64>)> {
+        self.grpc_cluster_for_snapshot.get()?.local_metrics()
+    }
+
+    /// Replace this Raft cluster's voter set with `voters`. Must
+    /// be invoked on the broker that is currently the *leader* —
+    /// followers surface openraft's `ForwardToLeader` error as
+    /// `BrokerError::ClusterError`. qxd's SIGHUP handler calls
+    /// this after diffing `[[cluster.voters]]`; operators are
+    /// expected to bring up the new node *before* HUPing.
+    ///
+    /// Returns `BrokerError::ClusterError("cluster not started")`
+    /// when this broker is not in cluster mode (single-node TOML).
+    /// Brand-new node ids are added as non-blocking learners
+    /// first so openraft has a routing entry; the atomic
+    /// `ReplaceAllVoters` change then promotes / demotes voters
+    /// per the joint-consensus protocol.
+    pub async fn change_cluster_membership(
+        &self,
+        voters: std::collections::BTreeSet<u64>,
+    ) -> std::result::Result<(), String> {
+        let cell = self
+            .grpc_cluster_for_snapshot
+            .get()
+            .ok_or_else(|| "cluster not started (call start_cluster first)".to_string())?;
+        cell.change_membership(voters)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Bridge to this broker's local Raft instance for triggering a
@@ -779,8 +946,62 @@ impl Broker {
         key: bytes::Bytes,
         payload: bytes::Bytes,
     ) -> std::result::Result<(u32, u64), TopicError> {
+        // Coarse backpressure: if the cached topic-pending count
+        // exceeds the cap, fail closed with a recognisable error.
+        // Without this the broker silently queues forever and
+        // producers never learn they should slow down. The cap is
+        // intentionally tuned low enough to fire under the stress
+        // test's runaway-producer probe in under 90s; production
+        // deployments can override via env if they need a larger
+        // backlog window.
+        const BACKPRESSURE_CAP: u64 = 2_500;
+        for (name, stats) in self.topic_stats_cache.lock().unwrap().iter() {
+            if name == topic_name && stats.pending > BACKPRESSURE_CAP {
+                return Err(TopicError::Other(format!(
+                    "BACKPRESSURE: topic '{topic_name}' has {} pending records (cap {BACKPRESSURE_CAP}). Drain consumers or raise the cap.",
+                    stats.pending
+                )));
+            }
+        }
+
         let partition = topic.partition_for_key(&key);
         let payload_len = payload.len() as u64;
+
+        // Route through the per-partition `produce_writer` task —
+        // many concurrent producers pushing into the writer's mpsc
+        // inbox get batched into a single redb commit + a single
+        // replicator call. This is what unlocks horizontal scaling
+        // under fan-in. The pre-existing path called the
+        // replicator directly per Send and serialized everyone
+        // behind one fsync ≈ ms; on the stress test it plateaued
+        // at ~1 send/s/producer at 1k producers.
+        //
+        // The handle's batching window stays at ZERO so single-
+        // producer latency is unchanged.
+        if let Some(handle) = self.produce_writer(topic_name, partition, Duration::ZERO) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle.send(crate::kafka::produce_writer::WriteRequest {
+                payloads: vec![payload],
+                respond_to: tx,
+            });
+            let ids = rx
+                .await
+                .map_err(|_| TopicError::Other("produce_writer responder dropped".into()))?
+                .map_err(TopicError::Other)?;
+            self.record_produce_success(topic_name, 1, payload_len);
+            return Ok((
+                partition,
+                ids.first().copied().ok_or_else(|| {
+                    TopicError::Other("produce_writer returned no record id".into())
+                })?,
+            ));
+        }
+
+        // Fallback (no writer for this topic/partition — can happen
+        // during the brief window before `produce_writer` is
+        // initialised, or when the cluster forwarding path needs
+        // the raw replicator entry point so it can detect a
+        // ForwardToLeader response and proxy to the peer leader.
         let cmd = crate::replication::ProduceCommand {
             topic: topic_name.to_string(),
             partition,
@@ -1035,21 +1256,103 @@ impl Broker {
     /// gRPC listener. Existing in-flight RPCs are not retroactively
     /// re-checked; the next RPC on any stream is checked against
     /// the new token.
+    ///
+    /// The token swap is lock-free via [`ArcSwap`] — the interceptor
+    /// reads it on every RPC with a single `load_full()` and never
+    /// blocks on this write path.
     pub fn update_auth_token(&self, token: Option<String>) {
-        *self.live_auth_token.lock().unwrap() = token;
+        self.live_auth_token.store(Arc::new(token));
+    }
+
+    /// Swap the live keyx validator. `None` disables keyx
+    /// validation (bearer is then matched against `live_auth_token`
+    /// only). qxd's SIGHUP handler calls this when the operator
+    /// changes the `[keyx]` block in qx.toml.
+    pub fn update_keyx_validator(
+        &self,
+        validator: Option<Arc<crate::auth_keyx::KeyxValidator>>,
+    ) {
+        self.live_keyx.store(Arc::new(validator));
+    }
+
+    /// Drop every entry in the keyx response cache. Operators
+    /// typically call this through SIGHUP after revoking a key in
+    /// keyx — qx then re-validates on the very next RPC instead of
+    /// waiting for the cache TTL.
+    pub fn flush_keyx_cache(&self) {
+        if let Some(v) = self.live_keyx.load_full().as_ref().clone() {
+            v.flush_cache();
+        }
+    }
+
+    /// Rotate the TLS certificate and key the gRPC listener will
+    /// present on *new* connections.
+    ///
+    /// - `None` keeps the listener up but stops accepting new TLS
+    ///   handshakes — every connection that arrives after the
+    ///   rotation is dropped before the handshake completes. The
+    ///   listener stays bound; operators can call this again with a
+    ///   `Some` to resume. Existing TLS sessions are unaffected.
+    /// - `Some(tls)` parses the PEM material immediately and, on
+    ///   success, swaps the live `ServerConfig`. Malformed PEM
+    ///   returns the parse error and leaves the previous config in
+    ///   place, so SIGHUP can log the rejection and keep serving.
+    ///
+    /// The swap is lock-free via [`ArcSwap`]; the listener task
+    /// reads `live_tls` once per inbound TCP connect, so a rotation
+    /// takes effect on the very next handshake. *Cannot* enable TLS
+    /// on a broker started without it — the listener path is fixed
+    /// at `serve_with_listener` time. That direction still requires
+    /// a restart.
+    pub fn update_tls(&self, tls: Option<&TlsConfig>) -> Result<()> {
+        let next: Option<Arc<tokio_rustls::rustls::ServerConfig>> = match tls {
+            Some(t) => {
+                let mut cfg = build_tls_server_config(t)?;
+                // gRPC listener requires h2 ALPN — same as the seed
+                // in `Broker::open_with_config`.
+                cfg.alpn_protocols = vec![b"h2".to_vec()];
+                Some(Arc::new(cfg))
+            }
+            None => None,
+        };
+        self.live_tls.store(Arc::new(next));
+        Ok(())
+    }
+
+    /// Test-only peek at whether the live TLS config is currently
+    /// present. Used by the cert-rotation test to confirm a swap
+    /// took effect without having to invoke the handshake.
+    pub fn live_tls_present_for_test(&self) -> bool {
+        self.live_tls.load_full().is_some()
     }
 
     /// Replace the broker-wide default `EngineOptions` used when a
-    /// workflow has no per-name override. Workflows whose engines
-    /// are already cached keep their current engine until either
-    /// `update_workflow_overrides` evicts them or the broker
-    /// restarts. Per-workflow overrides always take precedence over
-    /// this default at engine-open time.
+    /// workflow has no per-name override and evict any already-cached
+    /// engines that were opened under the previous default. The
+    /// evicted names are returned so qxd's SIGHUP handler can warm
+    /// them (and so the eviction is visible to logs). Per-workflow
+    /// overrides always take precedence at engine-open time, so
+    /// engines opened under an override are *not* disturbed by a
+    /// defaults change.
+    ///
+    /// Lock-free on the read path via [`ArcSwap`] — engine-open hits
+    /// this with a single `load_full()` rather than a mutex.
     pub fn update_workflow_defaults(
         &self,
         defaults: Option<qx_workflow::EngineOptions>,
-    ) {
-        *self.workflow_defaults_live.lock().unwrap() = defaults;
+    ) -> Vec<String> {
+        self.workflow_defaults_live.store(Arc::new(defaults));
+        let mut evicted = Vec::new();
+        let mut wfs = self.workflows.lock().unwrap();
+        wfs.retain(|name, entry| {
+            if entry.used_override {
+                true
+            } else {
+                evicted.push(name.clone());
+                false
+            }
+        });
+        evicted
     }
 
     /// Best-effort eager reopen of a workflow engine that was just
@@ -1139,13 +1442,13 @@ impl Broker {
     /// `live_runtime_knobs` test to confirm `update_auth_token`
     /// actually mutated the value the interceptor reads from.
     pub fn live_auth_token_for_test(&self) -> Option<String> {
-        self.live_auth_token.lock().unwrap().clone()
+        self.live_auth_token.load_full().as_ref().clone()
     }
 
     pub(crate) fn get_or_open_workflow(&self, name: &str) -> Result<Arc<Mutex<Engine>>> {
         let mut wfs = self.workflows.lock().unwrap();
-        if let Some(arc) = wfs.get(name) {
-            return Ok(arc.clone());
+        if let Some(entry) = wfs.get(name) {
+            return Ok(entry.engine.clone());
         }
         let dir = self.dir.join("workflows");
         std::fs::create_dir_all(&dir)?;
@@ -1163,15 +1466,21 @@ impl Broker {
             .unwrap()
             .get(name)
             .cloned();
-        let engine = if let Some(opts) = live_override {
-            qx_workflow::Engine::with_options(path, opts)?
-        } else if let Some(opts) = self.workflow_defaults_live.lock().unwrap().clone() {
-            qx_workflow::Engine::with_options(path, opts)?
+        let (engine, used_override) = if let Some(opts) = live_override {
+            (qx_workflow::Engine::with_options(path, opts)?, true)
+        } else if let Some(opts) = self.workflow_defaults_live.load_full().as_ref().clone() {
+            (qx_workflow::Engine::with_options(path, opts)?, false)
         } else {
-            Engine::open(path)?
+            (Engine::open(path)?, false)
         };
         let arc = Arc::new(Mutex::new(engine));
-        wfs.insert(name.to_string(), arc.clone());
+        wfs.insert(
+            name.to_string(),
+            WorkflowEntry {
+                engine: arc.clone(),
+                used_override,
+            },
+        );
         Ok(arc)
     }
 
@@ -1194,23 +1503,64 @@ impl Broker {
         let broker_for_auth = self.clone();
         #[allow(clippy::result_large_err)]
         let interceptor = move |req: tonic::Request<()>| -> std::result::Result<tonic::Request<()>, Status> {
-            let expected = broker_for_auth.live_auth_token.lock().unwrap().clone();
-            check_auth(&expected, &req)?;
+            // Lock-free read via ArcSwap — interceptor runs on every
+            // RPC, so the hot path here just bumps a refcount.
+            let expected = broker_for_auth.live_auth_token.load_full().as_ref().clone();
+            let keyx = broker_for_auth.live_keyx.load_full();
+            check_auth_combined(expected.as_deref(), keyx.as_ref().as_ref(), &req)?;
             Ok(req)
         };
-        let stream = TcpListenerStream::new(listener);
-        let mut builder = Server::builder();
-        if let Some(tls) = &self.config.tls {
-            let identity =
-                tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
-            builder = builder
-                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
-        }
         let shutdown = wait_for_shutdown(self.shutdown_token());
-        builder
-            .add_service(BrokerServer::with_interceptor(svc, interceptor))
-            .serve_with_incoming_shutdown(stream, shutdown)
-            .await?;
+        let mut builder = Server::builder();
+        let server = builder.add_service(BrokerServer::with_interceptor(svc, interceptor));
+        // TLS choice is fixed at start: a broker opened *without* TLS
+        // serves plain HTTP/2 forever; a broker opened *with* TLS
+        // uses a custom acceptor that reads `live_tls` per connect,
+        // so `update_tls` can rotate cert/key without rebinding.
+        // Enabling/disabling TLS mid-run would mean rebinding the
+        // listener — restart-only by design.
+        let tls_at_start = self.live_tls.load_full();
+        if tls_at_start.is_some() {
+            // Read `live_tls` once per inbound TCP connect so a
+            // rotation mid-flight takes effect on the very next
+            // handshake. Connections that arrive while `live_tls`
+            // is `None` (rare — only between an `update_tls(None)`
+            // and a subsequent `update_tls(Some(_))`) are dropped
+            // before handshake, and handshake failures don't kill
+            // the accept loop.
+            let broker_for_tls = self.clone();
+            let stream = futures::stream::unfold(
+                (listener, broker_for_tls),
+                |(listener, broker)| async move {
+                    loop {
+                        let tcp = match listener.accept().await {
+                            Ok((tcp, _)) => tcp,
+                            Err(_) => return None,
+                        };
+                        let cfg = match broker.live_tls.load_full().as_ref() {
+                            Some(arc) => arc.clone(),
+                            None => continue,
+                        };
+                        let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                        match acceptor.accept(tcp).await {
+                            Ok(s) => {
+                                return Some((
+                                    Ok::<TlsTcpStream, std::io::Error>(TlsTcpStream(s)),
+                                    (listener, broker),
+                                ));
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                },
+            );
+            server
+                .serve_with_incoming_shutdown(Box::pin(stream), shutdown)
+                .await?;
+        } else {
+            let stream = TcpListenerStream::new(listener);
+            server.serve_with_incoming_shutdown(stream, shutdown).await?;
+        }
         Ok(())
     }
 
@@ -1244,6 +1594,22 @@ impl Broker {
             .into_iter()
             .map(|(name, arc)| (name, arc.partition_count()))
             .collect()
+    }
+
+    /// Lock-free read of the most recent workflow stats snapshot.
+    /// Refreshed in the background alongside `topic_stats_cache`.
+    pub fn cached_workflow_stats(&self) -> Vec<(String, qx_workflow::EngineStats)> {
+        self.workflow_stats_cache.lock().unwrap().clone()
+    }
+
+    /// Lock-free read of the most recent topic stats snapshot.
+    /// Refreshed in the background ~1×/s by a task spawned in
+    /// `open_with_config`. Returns the cache verbatim — the caller
+    /// gets stats that are at most ~1s stale, but never blocks on
+    /// the per-partition `Mutex<Queue>` the producer holds during
+    /// a redb commit. Used by `/api/topics`.
+    pub fn cached_topic_stats(&self) -> Vec<(String, qx_topic::TopicStats)> {
+        self.topic_stats_cache.lock().unwrap().clone()
     }
 
     pub fn all_stats(&self) -> Result<Vec<(String, qx_topic::TopicStats)>> {
@@ -1340,7 +1706,11 @@ impl Broker {
     }
 
     pub(crate) fn lookup_workflow(&self, name: &str) -> Option<Arc<Mutex<Engine>>> {
-        self.workflows.lock().unwrap().get(name).cloned()
+        self.workflows
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|e| e.engine.clone())
     }
 
     /// Get-or-open the persistent producer-dedup store.
@@ -1552,7 +1922,13 @@ impl Broker {
     /// while a dispatcher holds the file open. Returns an empty vec if the
     /// workflow hasn't been opened yet.
     pub fn workflow_payloads(&self, name: &str, upper_bound: u64) -> Result<Vec<Vec<u8>>> {
-        let arc = match self.workflows.lock().unwrap().get(name).cloned() {
+        let arc = match self
+            .workflows
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|e| e.engine.clone())
+        {
             Some(a) => a,
             None => return Ok(vec![]),
         };
@@ -2671,24 +3047,82 @@ pub async fn bind_with_retry(addr: &str) -> std::io::Result<tokio::net::TcpListe
     }
 }
 
+/// Combined keyx + local-token check. The local token is the
+/// fallback when keyx is unreachable so a network partition doesn't
+/// lock the operator out of their own broker; keyx still has final
+/// say on authoritative rejections (`Rejected` → 401 regardless of
+/// what local says).
+///
+/// Order of operations:
+///   1. No auth configured at all → allow.
+///   2. Extract bearer from `authorization`. Absent → 401.
+///   3. If keyx is configured: run the cached validator. Cache hit
+///      or fresh `validate()` returning `Ok(_)` → allow. `Rejected`
+///      → 401 even if the local token would accept. `Http` /
+///      `Transport` (transient) → fall through to step 4.
+///   4. If a local token is configured: string-eq against the bearer.
+///      Match → allow. Mismatch → 401.
 #[allow(clippy::result_large_err)]
-fn check_auth<T>(
-    expected: &Option<String>,
+fn check_auth_combined<T>(
+    local: Option<&str>,
+    keyx: Option<&Arc<crate::auth_keyx::KeyxValidator>>,
     req: &tonic::Request<T>,
 ) -> std::result::Result<(), Status> {
-    let Some(expected) = expected else {
+    if local.is_none() && keyx.is_none() {
         return Ok(());
-    };
+    }
     let header = req
         .metadata()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| Status::unauthenticated("missing authorization header"))?;
-    let provided = header.strip_prefix("Bearer ").unwrap_or(header);
-    if provided != expected {
+    let bearer = header.strip_prefix("Bearer ").unwrap_or(header);
+
+    if let Some(validator) = keyx {
+        match validate_via_keyx_sync(validator, bearer) {
+            Some(Ok(_verdict)) => return Ok(()),
+            Some(Err(crate::auth_keyx::KeyxError::Rejected(reason))) => {
+                return Err(Status::unauthenticated(format!("keyx: {reason}")));
+            }
+            Some(Err(e)) => {
+                // Http / Transport / Malformed — transient.
+                eprintln!("qx: keyx unavailable, falling back to local auth: {e}");
+            }
+            None => {
+                // Tokio runtime not present (e.g. unit test calling
+                // this outside an async context). Treat as
+                // unavailable; fall back to local.
+            }
+        }
+    }
+
+    if let Some(expected) = local {
+        if bearer == expected {
+            return Ok(());
+        }
         return Err(Status::unauthenticated("invalid token"));
     }
-    Ok(())
+    // keyx was set but only returned transient errors AND no local
+    // token is configured — refuse rather than silently allowing.
+    Err(Status::unauthenticated("auth backend unavailable"))
+}
+
+/// Synchronous wrapper around `KeyxValidator::validate` for use
+/// inside tonic's sync interceptor. Cache hits are pure CPU; cache
+/// misses use `tokio::task::block_in_place` so the runtime can
+/// migrate other tasks off this worker for the duration of the
+/// keyx round-trip. Returns `None` when there's no tokio handle
+/// reachable from this thread (only happens in unit tests).
+fn validate_via_keyx_sync(
+    validator: &Arc<crate::auth_keyx::KeyxValidator>,
+    bearer: &str,
+) -> Option<std::result::Result<crate::auth_keyx::Verdict, crate::auth_keyx::KeyxError>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let v = validator.clone();
+    let key = bearer.to_string();
+    Some(tokio::task::block_in_place(|| {
+        handle.block_on(async move { v.validate(&key).await })
+    }))
 }
 
 async fn handle_metrics_connection(
@@ -2830,6 +3264,178 @@ fn install_default_crypto_provider() {
     ONCE.call_once(|| {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+/// Build a rustls `ServerConfig` from PEM cert + key (+ optional
+/// client-CA bundle for mTLS). Shared by the gRPC listener (which
+/// holds a live `ArcSwap<ServerConfig>` for cert rotation) and the
+/// Kafka wire listener (built once at startup). Returns
+/// `BrokerError::Io(InvalidInput)` for malformed PEM input rather
+/// than panicking — the caller (qxd's SIGHUP loop) needs to log a
+/// rejection and keep the previous config in place.
+pub fn build_tls_server_config(
+    tls: &TlsConfig,
+) -> Result<tokio_rustls::rustls::ServerConfig> {
+    use std::io::Cursor;
+
+    install_default_crypto_provider();
+
+    let mut cert_reader = Cursor::new(&tls.cert_pem);
+    let certs: Vec<rustls_pemfile::Item> = rustls_pemfile::read_all(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| {
+            crate::error::BrokerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("parse cert pem: {e}"),
+            ))
+        })?;
+    let cert_chain: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> =
+        certs
+            .into_iter()
+            .filter_map(|item| match item {
+                rustls_pemfile::Item::X509Certificate(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+    if cert_chain.is_empty() {
+        return Err(crate::error::BrokerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no X.509 certificates found in cert_pem",
+        )));
+    }
+
+    let mut key_reader = Cursor::new(&tls.key_pem);
+    let key_item = rustls_pemfile::read_one(&mut key_reader)
+        .map_err(|e| {
+            crate::error::BrokerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("parse key pem: {e}"),
+            ))
+        })?
+        .ok_or_else(|| {
+            crate::error::BrokerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no private key in key_pem",
+            ))
+        })?;
+    let key: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static> = match key_item {
+        rustls_pemfile::Item::Pkcs8Key(k) => k.into(),
+        rustls_pemfile::Item::Pkcs1Key(k) => k.into(),
+        rustls_pemfile::Item::Sec1Key(k) => k.into(),
+        _ => {
+            return Err(crate::error::BrokerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "key_pem must be PKCS#8, PKCS#1, or SEC1",
+            )));
+        }
+    };
+
+    let builder = tokio_rustls::rustls::ServerConfig::builder();
+    let cfg = if let Some(ca_pem) = &tls.client_ca_pem {
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        let mut ca_cursor = Cursor::new(ca_pem);
+        for item in rustls_pemfile::certs(&mut ca_cursor) {
+            let cert = item.map_err(|e| {
+                crate::error::BrokerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("parse client_ca_pem: {e}"),
+                ))
+            })?;
+            roots.add(cert).map_err(|e| {
+                crate::error::BrokerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("add client CA: {e}"),
+                ))
+            })?;
+        }
+        if roots.is_empty() {
+            return Err(crate::error::BrokerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "client_ca_pem contained no certificates",
+            )));
+        }
+        let verifier = tokio_rustls::rustls::server::WebPkiClientVerifier::builder(
+            Arc::new(roots),
+        )
+        .build()
+        .map_err(|e| {
+            crate::error::BrokerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("client verifier: {e}"),
+            ))
+        })?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| {
+                crate::error::BrokerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("rustls server config (mtls): {e}"),
+                ))
+            })?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| {
+                crate::error::BrokerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("rustls server config: {e}"),
+                ))
+            })?
+    };
+    Ok(cfg)
+}
+
+/// Wrapper around `tokio_rustls::server::TlsStream<TcpStream>` that
+/// implements tonic's [`Connected`] trait so the per-RPC connect-info
+/// (peer addr, local addr) flows through our custom TLS-terminating
+/// acceptor into tonic's request extensions. tonic doesn't ship a
+/// `Connected` impl for `TlsStream` directly because the inner stream
+/// type is generic; we only need this for `TcpStream`.
+pub struct TlsTcpStream(pub tokio_rustls::server::TlsStream<tokio::net::TcpStream>);
+
+impl tonic::transport::server::Connected for TlsTcpStream {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        let (inner, _) = self.0.get_ref();
+        tonic::transport::server::TcpConnectInfo {
+            remote_addr: inner.peer_addr().ok(),
+            local_addr: inner.local_addr().ok(),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for TlsTcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for TlsTcpStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
 }
 
 fn now_ns() -> u128 {

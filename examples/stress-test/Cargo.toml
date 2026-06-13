@@ -1,0 +1,13 @@
+[package]
+name = "stress-test"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+qx-broker = { path = "../../crates/broker" }
+tokio.workspace = true
+
+[[bin]]
+name = "stress-test"
+path = "src/main.rs"

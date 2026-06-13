@@ -5,6 +5,7 @@
 //!   `Client`  — high-level client over the generated tonic stub.
 
 pub mod admin_api;
+pub mod auth_keyx;
 mod client;
 mod dashboard_assets;
 mod error;
@@ -20,6 +21,7 @@ pub mod proto {
     tonic::include_proto!("qx.v1");
 }
 
+pub use auth_keyx::{CacheStats as KeyxCacheStats, KeyxError, KeyxValidator, Verdict as KeyxVerdict};
 pub use client::Client;
 pub use error::{BrokerError, Result};
 pub use kafka::produce::dump_produce_timings;

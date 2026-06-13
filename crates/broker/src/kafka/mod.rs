@@ -1,3 +1,10 @@
+// Kafka wire-protocol structs parse more fields than the broker
+// currently consumes — request shapes are kept faithful to the
+// upstream spec so new request handling can be wired without re-
+// parsing. The unused fields are intentional and tracked here as a
+// single allow rather than scattered per-field annotations.
+#![allow(dead_code)]
+
 //! Kafka wire-protocol surface for the broker.
 //!
 //! This module implements just enough of the Kafka client protocol that

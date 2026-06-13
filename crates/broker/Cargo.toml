@@ -36,6 +36,8 @@ sha2.workspace = true
 pbkdf2.workspace = true
 base64.workspace = true
 rand.workspace = true
+arc-swap.workspace = true
+reqwest.workspace = true
 async-trait.workspace = true
 qx-raft = { path = "../raft" }
 serde.workspace = true
@@ -54,7 +56,12 @@ base64.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 pbkdf2.workspace = true
+wiremock.workspace = true
 
 [[bench]]
 name = "kafka_bench"
+harness = false
+
+[[bench]]
+name = "produce_throughput"
 harness = false

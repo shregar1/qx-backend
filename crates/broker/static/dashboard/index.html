@@ -1,15 +1,31 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>QX — broker console</title>
-    <meta name="color-scheme" content="dark" />
-    <script type="module" crossorigin src="/assets/index-D6EB4mT8.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-D2IFTWXq.css">
+    <script>
+      // Set the initial theme class synchronously so the first paint
+      // doesn't flash the wrong colour scheme. Default is dark — only
+      // a previous *explicit* "light" choice (saved by the toggle to
+      // localStorage) opts out. We intentionally don't consult
+      // `prefers-color-scheme` here: every sibling broker product
+      // ships dark-default, and the dashboard mirrors that.
+      (function () {
+        try {
+          var saved = localStorage.getItem("qx-theme");
+          if (saved !== "light") document.documentElement.classList.add("dark");
+        } catch (_) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-D2BBe_1V.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-CZ65N1Vh.css">
   </head>
-  <body class="bg-slate-950">
+  <body>
     <div id="root"></div>
   </body>
 </html>

@@ -397,6 +397,47 @@ async fn auth_rejects_wrong_token() {
 }
 
 #[tokio::test]
+async fn auth_token_can_be_rotated_at_runtime() {
+    // SIGHUP in qxd calls Broker::update_auth_token at runtime to
+    // rotate the bearer token without re-binding the gRPC listener.
+    // Here we exercise the same code path directly: an RPC sent
+    // with the old token is rejected after the swap, and an RPC
+    // sent with the new token is accepted, all on the same server.
+    let (_tmp, broker, url) = start_server_with_token("original").await;
+
+    // Original token still works.
+    let mut old_client = Client::connect_with_token(url.clone(), "original".into())
+        .await
+        .unwrap();
+    old_client.open_topic("t", 1).await.unwrap();
+
+    // Rotate the token.
+    broker.update_auth_token(Some("rotated".into()));
+
+    // The same connection that used to work now fails: the
+    // interceptor re-reads the live token on every request.
+    let err = old_client.open_topic("t2", 1).await.unwrap_err();
+    match err {
+        qx_broker::BrokerError::Rpc(status) => {
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        }
+        other => panic!("expected unauthenticated after rotation, got {other:?}"),
+    }
+
+    // A new client using the rotated token is accepted.
+    let mut new_client = Client::connect_with_token(url.clone(), "rotated".into())
+        .await
+        .unwrap();
+    new_client.open_topic("t3", 1).await.unwrap();
+
+    // Disabling the token entirely re-opens the listener to
+    // anonymous clients.
+    broker.update_auth_token(None);
+    let mut anon_client = Client::connect(url).await.unwrap();
+    anon_client.open_topic("t4", 1).await.unwrap();
+}
+
+#[tokio::test]
 async fn metrics_endpoint_exposes_topic_gauges() {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

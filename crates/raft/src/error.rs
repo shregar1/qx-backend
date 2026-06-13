@@ -8,6 +8,9 @@ pub enum RaftError {
     #[error("openraft client write: {0}")]
     ClientWrite(String),
 
+    #[error("openraft change_membership: {0}")]
+    ChangeMembership(String),
+
     #[error("openraft initialization timeout (no leader elected)")]
     LeaderTimeout,
 
