@@ -1,6 +1,6 @@
 //! orders-pipeline — a self-contained example of how to wire QX end-to-end.
 //!
-//! Embeds a broker (no `qxd` needed to run), then in the same process:
+//! Embeds a broker (no `qx` needed to run), then in the same process:
 //! 1. A producer task sends 10 orders to topic `orders` with key = order id.
 //! 2. Two consumers join the `fulfillment` group, pull their assigned
 //!    partitions, and (for each order) create a workflow task `deploy-order`

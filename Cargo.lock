@@ -1751,6 +1751,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qx"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "qx-broker",
+ "qx-workflow",
+ "rcgen",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "qx-broker"
 version = "0.1.0"
 dependencies = [
@@ -1894,20 +1908,6 @@ dependencies = [
  "redb",
  "tempfile",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "qxd"
-version = "0.1.0"
-dependencies = [
- "clap",
- "qx-broker",
- "qx-workflow",
- "rcgen",
- "serde",
- "tempfile",
- "tokio",
- "toml",
 ]
 
 [[package]]

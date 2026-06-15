@@ -1,4 +1,4 @@
-//! Multi-process integration test: spawn three `qxd` binaries with
+//! Multi-process integration test: spawn three `qx` binaries with
 //! cluster TOML configs, wait for them to form a Raft cluster, then
 //! drive a Produce through the leader's gRPC and verify the record
 //! replicates to a non-leader's local Topic.
@@ -21,16 +21,16 @@ const NUM_BROKERS: u64 = 3;
 const TOPIC: &str = "ledger";
 
 #[tokio::test]
-async fn three_qxd_subprocesses_form_a_cluster_and_replicate_a_produce() {
+async fn three_qx_subprocesses_form_a_cluster_and_replicate_a_produce() {
     let tmp = TempDir::new().unwrap();
 
     // Reserve six ports up front: three for client gRPC, three for
     // the inter-broker Raft transport. We HOLD the listeners until
-    // immediately before each qxd is spawned — under workspace-
+    // immediately before each qx is spawned — under workspace-
     // parallel `cargo test`, releasing the port first lets another
     // test grab it in the window before the child binds. Keeping the
     // listener bound until the spawn site narrows the race to a few
-    // microseconds and the `bind_with_retry` loop on the qxd side
+    // microseconds and the `bind_with_retry` loop on the qx side
     // closes the remaining gap.
     let mut client_ports = Vec::new();
     let mut raft_ports = Vec::new();
@@ -58,7 +58,7 @@ async fn three_qxd_subprocesses_form_a_cluster_and_replicate_a_produce() {
     for id in 0..NUM_BROKERS {
         let data_dir = tmp.path().join(format!("data-{id}"));
         std::fs::create_dir_all(&data_dir).unwrap();
-        let config_path = tmp.path().join(format!("qxd-{id}.toml"));
+        let config_path = tmp.path().join(format!("qx-{id}.toml"));
         let cfg = format!(
             r#"[server]
 addr = "127.0.0.1:{client_port}"
@@ -88,7 +88,7 @@ node_id = {id}
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .expect("spawn qxd");
+            .expect("spawn qx");
         children.push(child);
     }
 
@@ -207,7 +207,7 @@ async fn wait_until_port_open(port: u16, timeout: Duration) {
             return;
         }
         if Instant::now() >= deadline {
-            panic!("qxd never bound to port {port} within {timeout:?}");
+            panic!("qx never bound to port {port} within {timeout:?}");
         }
         sleep(Duration::from_millis(50)).await;
     }

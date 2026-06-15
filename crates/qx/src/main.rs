@@ -1,6 +1,6 @@
-//! qxd — QX broker daemon.
+//! qx — QX broker daemon.
 //!
-//! Loads a TOML config (default `qxd.toml`), starts the gRPC broker server
+//! Loads a TOML config (default `qx.toml`), starts the gRPC broker server
 //! and (optionally) the Prometheus metrics HTTP endpoint, and logs what it's
 //! serving. Shuts down cleanly on SIGINT.
 
@@ -13,7 +13,7 @@ use qx_broker::{
 };
 
 /// Diff key extracted from a parsed `[tls]` block. We compare these
-/// in qxd's SIGHUP loop instead of the raw `toml::Value` so a
+/// in qx's SIGHUP loop instead of the raw `toml::Value` so a
 /// reformat of the file (whitespace, key-order) doesn't trigger a
 /// pointless cert-rotation.
 type TlsFingerprint = Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)>;
@@ -23,7 +23,7 @@ use serde::Deserialize;
 #[command(name = "qx", about = "QX — broker, dashboard, admin API")]
 struct Args {
     /// Path to TOML config.
-    #[arg(short, long, default_value = "qxd.toml")]
+    #[arg(short, long, default_value = "qx.toml")]
     config: PathBuf,
 }
 
@@ -293,7 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The dashboard + Prometheus metrics + admin API all share one
     // HTTP listener. We start it unconditionally now — the broker
     // ships an embedded node dashboard (`include_dir!` baked into
-    // the binary), so "qxd is running" implies "the dashboard is
+    // the binary), so "qx is running" implies "the dashboard is
     // reachable". Operators who want a different bind address
     // override it under `[metrics]`; operators who genuinely don't
     // want any HTTP surface can set `[metrics].addr = "off"` to
@@ -488,7 +488,7 @@ fn read_tls_fingerprint(raw: &toml::Value) -> Result<TlsFingerprint, std::io::Er
 }
 
 /// Build a `KeyxValidator` from a parsed `[keyx]` block. Returns
-/// a string error so qxd's SIGHUP handler can log the rejection
+/// a string error so qx's SIGHUP handler can log the rejection
 /// and keep the previous validator (if any) in place.
 fn build_keyx_validator(cfg: &KeyxCfg) -> std::result::Result<KeyxValidator, String> {
     let cache_ttl = std::time::Duration::from_secs(cfg.cache_ttl_secs.unwrap_or(60));
@@ -545,7 +545,7 @@ fn compute_workflow_knobs(
 /// applied `[workflow]` and `[auth]` block values are compared
 /// against each tick's freshly-parsed TOML, and the broker is only
 /// touched when one of them actually changed. Stays in scope for
-/// the entire qxd lifetime; aborted on shutdown.
+/// the entire qx lifetime; aborted on shutdown.
 #[cfg(unix)]
 async fn sighup_loop(
     broker: std::sync::Arc<Broker>,

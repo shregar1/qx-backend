@@ -1,6 +1,6 @@
 //! `Broker::update_workflow_overrides` — runtime swap test.
 //!
-//! qxd wires this method to SIGHUP so operators can re-tune
+//! qx wires this method to SIGHUP so operators can re-tune
 //! per-workflow `EngineOptions` without restarting the broker. The
 //! contract is:
 //!
@@ -9,7 +9,7 @@
 //!      on-disk engine with the new options.
 //!   2. Workflows whose options didn't change are NOT disturbed.
 //!   3. The return value lists exactly the workflows whose handles
-//!      were dropped, so qxd can log a meaningful summary.
+//!      were dropped, so qx can log a meaningful summary.
 
 use std::collections::HashMap;
 

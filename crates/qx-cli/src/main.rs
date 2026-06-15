@@ -1,6 +1,6 @@
 //! qx — QX command-line client.
 //!
-//! Connects to a running `qxd` and performs queue / consumer-group / workflow
+//! Connects to a running `qx` and performs queue / consumer-group / workflow
 //! / schema-registry operations. Optional bearer-token auth and TLS.
 
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:50051", global = true)]
     addr: String,
 
-    /// Optional bearer token (matches the qxd `auth.token` config).
+    /// Optional bearer token (matches the qx `auth.token` config).
     #[arg(long, global = true)]
     token: Option<String>,
 

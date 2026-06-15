@@ -1,6 +1,6 @@
-//! Process-level integration test for qxd's SIGHUP reload path.
+//! Process-level integration test for qx's SIGHUP reload path.
 //!
-//! Spawns the qxd binary against a TOML config, sends SIGHUP, and
+//! Spawns the qx binary against a TOML config, sends SIGHUP, and
 //! checks that:
 //!
 //!   1. Editing the `[auth].token` and HUPing rotates the live
@@ -32,7 +32,7 @@ async fn sighup_rotates_auth_token_and_skips_no_op_reload() {
     let port = probe.local_addr().unwrap().port();
     drop(probe);
 
-    let config_path = tmp.path().join("qxd.toml");
+    let config_path = tmp.path().join("qx.toml");
     write_config_with_token(&config_path, &data_dir, port, "before").await;
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qx"))
@@ -42,14 +42,14 @@ async fn sighup_rotates_auth_token_and_skips_no_op_reload() {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("failed to spawn qxd");
+        .expect("failed to spawn qx");
 
     let stderr = child.stderr.take().expect("piped stderr");
     let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            eprintln!("qxd> {line}");
+            eprintln!("qx> {line}");
             let _ = stderr_tx.send(line);
         }
     });
@@ -158,7 +158,7 @@ async fn wait_for_stderr(
     })
     .await;
     if res.is_err() {
-        panic!("qxd stderr did not contain {needle:?} within {deadline:?}");
+        panic!("qx stderr did not contain {needle:?} within {deadline:?}");
     }
 }
 
@@ -169,7 +169,7 @@ async fn wait_until_port_open(port: u16, deadline: Duration) {
             return;
         }
         if Instant::now() >= limit {
-            panic!("qxd never bound to port {port} within {deadline:?}");
+            panic!("qx never bound to port {port} within {deadline:?}");
         }
         sleep(Duration::from_millis(50)).await;
     }

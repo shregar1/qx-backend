@@ -1,5 +1,5 @@
 //! Real Kafka client validation: spawn `kcat` (librdkafka 2.x) against a
-//! live qxd broker and verify metadata, produce, consume, and admin paths
+//! live qx broker and verify metadata, produce, consume, and admin paths
 //! all work over the wire.
 
 use std::time::Duration;

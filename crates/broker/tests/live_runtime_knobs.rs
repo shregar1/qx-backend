@@ -1,12 +1,12 @@
-//! Live mutability for the broker knobs qxd's SIGHUP handler
+//! Live mutability for the broker knobs qx's SIGHUP handler
 //! rewires at runtime:
 //!
 //!   * `update_auth_token`        — bearer token rotation
 //!   * `update_workflow_defaults` — broker-wide engine defaults
 //!   * `warm_workflow`            — eager reopen after override evict
 //!
-//! These are unit-level checks. The end-to-end qxd subprocess HUP
-//! integration lives separately under `qxd/tests`.
+//! These are unit-level checks. The end-to-end qx subprocess HUP
+//! integration lives separately under `qx/tests`.
 
 use std::collections::HashMap;
 
@@ -144,7 +144,7 @@ fn warm_workflow_reopens_after_override_evict() {
 #[test]
 fn warm_workflow_is_idempotent() {
     // A second warm_workflow call should still succeed (no-op) when
-    // the engine is already cached — qxd may invoke warm_workflow
+    // the engine is already cached — qx may invoke warm_workflow
     // for a name that was already warm.
     let tmp = TempDir::new().unwrap();
     let broker = Broker::open_with_config(tmp.path(), BrokerConfig::default());

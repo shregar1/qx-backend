@@ -1,7 +1,7 @@
-//! Process-level integration test: spawn the `qxd` binary with a TOML config
+//! Process-level integration test: spawn the `qx` binary with a TOML config
 //! that enables TLS, then connect a `qx-broker::Client` with TLS and run a
 //! send/stream round-trip. Verifies the full external-process producer →
-//! qxd-on-the-wire → broker TLS path.
+//! qx-on-the-wire → broker TLS path.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, Instant};
 
 #[tokio::test]
-async fn qxd_subprocess_serves_tls_and_round_trips() {
+async fn qx_subprocess_serves_tls_and_round_trips() {
     // 1. Generate a self-signed cert good for "localhost".
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = cert.cert.pem();
@@ -27,12 +27,12 @@ async fn qxd_subprocess_serves_tls_and_round_trips() {
     write_file(&cert_path, cert_pem.as_bytes()).await;
     write_file(&key_path, key_pem.as_bytes()).await;
 
-    // Pick an unused port up-front by binding then releasing — qxd will rebind.
+    // Pick an unused port up-front by binding then releasing — qx will rebind.
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
 
-    let config_path = tmp.path().join("qxd.toml");
+    let config_path = tmp.path().join("qx.toml");
     let config_text = format!(
         r#"[server]
 addr = "127.0.0.1:{port}"
@@ -48,7 +48,7 @@ key_file = "{key}"
     );
     write_file(&config_path, config_text.as_bytes()).await;
 
-    // 3. Spawn qxd as a subprocess.
+    // 3. Spawn qx as a subprocess.
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qx"))
         .arg("--config")
         .arg(&config_path)
@@ -56,9 +56,9 @@ key_file = "{key}"
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("failed to spawn qxd");
+        .expect("failed to spawn qx");
 
-    // 4. Wait until qxd is accepting TCP connections on its port (max ~5s).
+    // 4. Wait until qx is accepting TCP connections on its port (max ~5s).
     let url = format!("https://localhost:{port}");
     wait_until_port_open(port, Duration::from_secs(5)).await;
 
@@ -81,7 +81,7 @@ key_file = "{key}"
     let payloads: Vec<_> = batch.iter().map(|r| r.payload.clone()).collect();
     assert_eq!(payloads, vec![b"hello-over-tls".to_vec()]);
 
-    // 7. Tear down qxd.
+    // 7. Tear down qx.
     drop(client);
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -100,7 +100,7 @@ async fn wait_until_port_open(port: u16, timeout: Duration) {
             return;
         }
         if Instant::now() >= deadline {
-            panic!("qxd never bound to port {port} within {timeout:?}");
+            panic!("qx never bound to port {port} within {timeout:?}");
         }
         sleep(Duration::from_millis(50)).await;
     }

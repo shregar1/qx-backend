@@ -196,7 +196,7 @@ pub struct Broker {
     /// Live (mutable) copy of the per-workflow overrides. Seeded from
     /// `BrokerConfig::workflow_overrides` at open time; can be
     /// replaced at runtime via [`Self::update_workflow_overrides`] —
-    /// qxd wires this to SIGHUP so operators can adjust per-workflow
+    /// qx wires this to SIGHUP so operators can adjust per-workflow
     /// engine sizing without a full broker restart.
     workflow_overrides_live:
         Mutex<HashMap<String, qx_workflow::EngineOptions>>,
@@ -354,7 +354,7 @@ impl Broker {
             Ok(r) => Arc::new(r),
             Err(e) => {
                 eprintln!(
-                    "qxd: failed to open persistent TxnRegistry ({e}); falling back to in-memory"
+                    "qx: failed to open persistent TxnRegistry ({e}); falling back to in-memory"
                 );
                 Arc::new(crate::kafka::transactions::TxnRegistry::default())
             }
@@ -404,7 +404,7 @@ impl Broker {
         // Build the rustls server config up front so a malformed
         // PEM rejects at startup rather than at first connect. We
         // panic here because (a) Broker::open* historically
-        // doesn't return Result, and (b) qxd should fail loud and
+        // doesn't return Result, and (b) qx should fail loud and
         // early if its TLS material is broken. We set ALPN to h2
         // (HTTP/2) here because the gRPC listener uses this seed —
         // without it tonic's h2 transport rejects the connection
@@ -515,7 +515,7 @@ impl Broker {
         }
 
         // Boot-time event so the dashboard's events panel never
-        // shows "no events" once qxd is healthy. Cheap — one
+        // shows "no events" once qx is healthy. Cheap — one
         // ring push.
         broker.emit_event(
             crate::admin_api::EventLevel::Info,
@@ -729,7 +729,7 @@ impl Broker {
     /// Replace this Raft cluster's voter set with `voters`. Must
     /// be invoked on the broker that is currently the *leader* —
     /// followers surface openraft's `ForwardToLeader` error as
-    /// `BrokerError::ClusterError`. qxd's SIGHUP handler calls
+    /// `BrokerError::ClusterError`. qx's SIGHUP handler calls
     /// this after diffing `[[cluster.voters]]`; operators are
     /// expected to bring up the new node *before* HUPing.
     ///
@@ -1251,7 +1251,7 @@ impl Broker {
     }
 
     /// Replace the bearer token the gRPC interceptor expects on
-    /// every incoming RPC. `None` disables auth. qxd wires this to
+    /// every incoming RPC. `None` disables auth. qx wires this to
     /// SIGHUP so operators can rotate tokens without restarting the
     /// gRPC listener. Existing in-flight RPCs are not retroactively
     /// re-checked; the next RPC on any stream is checked against
@@ -1266,7 +1266,7 @@ impl Broker {
 
     /// Swap the live keyx validator. `None` disables keyx
     /// validation (bearer is then matched against `live_auth_token`
-    /// only). qxd's SIGHUP handler calls this when the operator
+    /// only). qx's SIGHUP handler calls this when the operator
     /// changes the `[keyx]` block in qx.toml.
     pub fn update_keyx_validator(
         &self,
@@ -1329,7 +1329,7 @@ impl Broker {
     /// Replace the broker-wide default `EngineOptions` used when a
     /// workflow has no per-name override and evict any already-cached
     /// engines that were opened under the previous default. The
-    /// evicted names are returned so qxd's SIGHUP handler can warm
+    /// evicted names are returned so qx's SIGHUP handler can warm
     /// them (and so the eviction is visible to logs). Per-workflow
     /// overrides always take precedence at engine-open time, so
     /// engines opened under an override are *not* disturbed by a
@@ -1357,7 +1357,7 @@ impl Broker {
 
     /// Best-effort eager reopen of a workflow engine that was just
     /// evicted by [`Self::update_workflow_overrides`] (typically
-    /// invoked by qxd's SIGHUP handler right after the swap).
+    /// invoked by qx's SIGHUP handler right after the swap).
     /// Returns `true` when the engine reopened; `false` when redb's
     /// per-file lock refuses a second instance because an in-flight
     /// caller still holds the prior `Arc<Mutex<Engine>>`. A `false`
@@ -1379,7 +1379,7 @@ impl Broker {
     /// new one. This avoids stalling outstanding redb transactions.
     ///
     /// Returns the set of workflow names whose cached engine was
-    /// dropped — qxd logs this so operators can see what the SIGHUP
+    /// dropped — qx logs this so operators can see what the SIGHUP
     /// reload touched.
     pub fn update_workflow_overrides(
         &self,
@@ -1457,7 +1457,7 @@ impl Broker {
         // default `workflow_options`; both fall back to the historical
         // `Engine::open` shape when nothing is configured. The live
         // overrides map can be mutated at runtime via
-        // [`Self::update_workflow_overrides`] (qxd wires that to
+        // [`Self::update_workflow_overrides`] (qx wires that to
         // SIGHUP), so we read it once here for this open and capture
         // the chosen options.
         let live_override = self
@@ -3026,7 +3026,7 @@ fn join_err(e: tokio::task::JoinError) -> Status {
 /// loop closes that race without affecting normal startup latency on
 /// an actually-occupied port.
 ///
-/// Exposed publicly so `qxd` (and any other binary built on top of
+/// Exposed publicly so `qx` (and any other binary built on top of
 /// `qx-broker`) can share the same retry logic at every bind site
 /// instead of duplicating it.
 pub async fn bind_with_retry(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
@@ -3172,7 +3172,7 @@ async fn handle_metrics_connection(
             // response so the stream owns its buffer.
             ("200 OK", ct, bytes.to_vec())
         } else if path == "/" && crate::dashboard_assets::is_empty() {
-            // Operator built qxd without dropping the dashboard
+            // Operator built qx without dropping the dashboard
             // dist into `static/dashboard/`. Keep the legacy
             // "Prometheus at root" behaviour so existing scrapers
             // pointed at `/` keep working.
@@ -3271,7 +3271,7 @@ fn install_default_crypto_provider() {
 /// holds a live `ArcSwap<ServerConfig>` for cert rotation) and the
 /// Kafka wire listener (built once at startup). Returns
 /// `BrokerError::Io(InvalidInput)` for malformed PEM input rather
-/// than panicking — the caller (qxd's SIGHUP loop) needs to log a
+/// than panicking — the caller (qx's SIGHUP loop) needs to log a
 /// rejection and keep the previous config in place.
 pub fn build_tls_server_config(
     tls: &TlsConfig,

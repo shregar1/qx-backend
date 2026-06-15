@@ -6,7 +6,7 @@
 //!     # in qx-dashboard/
 //!     npm run build
 //!     cp -R dist/. ../queuex/crates/broker/static/dashboard/
-//!     # then rebuild qxd: cargo build --release -p qxd
+//!     # then rebuild qx: cargo build --release -p qx
 //!
 //! Routes (handled by `server.rs::handle_metrics_connection`):
 //!   - GET /                 → index.html
@@ -63,7 +63,7 @@ fn index_html() -> Option<(&'static str, &'static [u8])> {
 
 /// True when no dashboard bundle was embedded. The HTTP handler
 /// uses this to keep the legacy `GET /` → Prometheus behaviour for
-/// installations that build qxd without the dashboard checked in.
+/// installations that build qx without the dashboard checked in.
 pub fn is_empty() -> bool {
     ASSETS.get_file("index.html").is_none()
 }

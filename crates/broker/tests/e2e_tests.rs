@@ -398,7 +398,7 @@ async fn auth_rejects_wrong_token() {
 
 #[tokio::test]
 async fn auth_token_can_be_rotated_at_runtime() {
-    // SIGHUP in qxd calls Broker::update_auth_token at runtime to
+    // SIGHUP in qx calls Broker::update_auth_token at runtime to
     // rotate the bearer token without re-binding the gRPC listener.
     // Here we exercise the same code path directly: an RPC sent
     // with the old token is rejected after the swap, and an RPC

@@ -9,7 +9,7 @@ members = [
     "crates/raft",
     "crates/schema-registry",
     "crates/mirror",
-    "crates/qxd",
+    "crates/qx",
     "crates/qx-cli",
     "examples/orders-pipeline",
     "examples/raft-cluster",

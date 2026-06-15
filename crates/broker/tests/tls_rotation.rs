@@ -1,6 +1,6 @@
 //! Cert rotation via `Broker::update_tls`.
 //!
-//! Drives the same path qxd's SIGHUP handler will use: start a
+//! Drives the same path qx's SIGHUP handler will use: start a
 //! broker with one cert, prove a client trusting that cert can
 //! connect, swap the live `ServerConfig` for a *different* self-
 //! signed cert, then prove:
@@ -104,7 +104,7 @@ async fn update_tls_rotates_cert_for_new_handshakes() {
 #[tokio::test]
 async fn update_tls_rejects_malformed_pem_and_keeps_previous_cert() {
     // A malformed PEM rotation attempt must NOT clobber the live
-    // config — qxd's SIGHUP loop relies on this to log the parse
+    // config — qx's SIGHUP loop relies on this to log the parse
     // failure and keep the listener up.
     let _tmp = TempDir::new().unwrap();
 

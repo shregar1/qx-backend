@@ -1,15 +1,15 @@
-//! qxd auto-serves the embedded dashboard.
+//! qx auto-serves the embedded dashboard.
 //!
 //! Pre-condition for this test to be meaningful: the embedded
 //! bundle under `crates/broker/static/dashboard/` exists. If a
 //! contributor runs `cargo test` without first running
 //! `scripts/build-dashboard.sh`, the bundle still exists from the
 //! last commit — but if you've intentionally emptied it,
-//! `dashboard_assets::is_empty()` returns true and qxd serves a
+//! `dashboard_assets::is_empty()` returns true and qx serves a
 //! placeholder. Either way, GET / should return 200.
 //!
 //! What this test pins down:
-//!   1. qxd with NO `[metrics]` block in the TOML still binds an
+//!   1. qx with NO `[metrics]` block in the TOML still binds an
 //!      HTTP listener and serves the dashboard.
 //!   2. The dashboard SPA fallback works — `/signin` (and any
 //!      other client-side route) returns the SPA shell so React
@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Instant, sleep, timeout};
 
 #[tokio::test]
-async fn qxd_without_metrics_block_still_serves_dashboard() {
+async fn qx_without_metrics_block_still_serves_dashboard() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -34,7 +34,7 @@ async fn qxd_without_metrics_block_still_serves_dashboard() {
     // Pick two ephemeral ports — one for gRPC and one for the
     // dashboard. We don't put the dashboard port in the TOML; that's
     // the point of this test. Instead, we drop the [metrics] block
-    // entirely and the qxd default kicks in.
+    // entirely and the qx default kicks in.
     //
     // But that default is a fixed `127.0.0.1:9090`, which may already
     // be in use on the CI host. Workaround: override via env var.
@@ -52,7 +52,7 @@ async fn qxd_without_metrics_block_still_serves_dashboard() {
     // well — by reading the startup banner against a config that
     // omits [metrics], but using a different config file we can
     // examine without colliding on 9090.
-    let config_path = tmp.path().join("qxd.toml");
+    let config_path = tmp.path().join("qx.toml");
     let config_text = format!(
         r#"[server]
 addr = "127.0.0.1:{grpc_port}"
@@ -72,14 +72,14 @@ addr = "127.0.0.1:{dash_port}"
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn qxd");
+        .expect("spawn qx");
 
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            eprintln!("qxd> {line}");
+            eprintln!("qx> {line}");
             let _ = tx.send(line);
         }
     });
@@ -123,7 +123,7 @@ addr = "127.0.0.1:{dash_port}"
 }
 
 #[tokio::test]
-async fn qxd_with_metrics_off_does_not_bind_dashboard() {
+async fn qx_with_metrics_off_does_not_bind_dashboard() {
     // The explicit opt-out path: `[metrics].addr = "off"`.
     // The startup banner should announce the disable; binding 9090
     // should NOT happen.
@@ -135,7 +135,7 @@ async fn qxd_with_metrics_off_does_not_bind_dashboard() {
     let grpc_port = grpc_probe.local_addr().unwrap().port();
     drop(grpc_probe);
 
-    let config_path = tmp.path().join("qxd.toml");
+    let config_path = tmp.path().join("qx.toml");
     let config_text = format!(
         r#"[server]
 addr = "127.0.0.1:{grpc_port}"
@@ -155,14 +155,14 @@ addr = "off"
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn qxd");
+        .expect("spawn qx");
 
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            eprintln!("qxd> {line}");
+            eprintln!("qx> {line}");
             let _ = tx.send(line);
         }
     });
@@ -185,7 +185,7 @@ async fn wait_until_port_open(port: u16, deadline: Duration) {
             return;
         }
         if Instant::now() >= limit {
-            panic!("qxd never bound to port {port} within {deadline:?}");
+            panic!("qx never bound to port {port} within {deadline:?}");
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -205,7 +205,7 @@ async fn wait_for_line(
     })
     .await;
     if res.is_err() {
-        panic!("qxd stderr did not contain {needle:?} within {deadline:?}");
+        panic!("qx stderr did not contain {needle:?} within {deadline:?}");
     }
 }
 

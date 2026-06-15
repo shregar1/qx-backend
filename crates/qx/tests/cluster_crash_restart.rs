@@ -1,4 +1,4 @@
-//! Multi-process crash + restart: spawn three `qxd` brokers
+//! Multi-process crash + restart: spawn three `qx` brokers
 //! configured for cluster mode, drive a steady stream of Produces
 //! through one of them, SIGKILL a follower, restart it with its
 //! original data directory, then drive more Produces and verify:
@@ -48,7 +48,7 @@ async fn follower_restart_catches_up_without_duplicate_apply() {
     for id in 0..NUM_BROKERS {
         let data_dir = tmp.path().join(format!("data-{id}"));
         std::fs::create_dir_all(&data_dir).unwrap();
-        let config_path = tmp.path().join(format!("qxd-{id}.toml"));
+        let config_path = tmp.path().join(format!("qx-{id}.toml"));
         let cfg = format!(
             r#"[server]
 addr = "127.0.0.1:{client_port}"
@@ -71,7 +71,7 @@ node_id = {id}
     // Spawn the three brokers.
     let mut children = Vec::new();
     for path in &config_paths {
-        children.push(spawn_qxd(path).await);
+        children.push(spawn_qx(path).await);
     }
     for p in &client_ports {
         wait_until_port_open(*p, Duration::from_secs(15)).await;
@@ -172,7 +172,7 @@ node_id = {id}
     // therefore the same data directory). Its Raft log + topic data
     // are still on disk; it has to catch up the 10 newer entries
     // through Raft replication.
-    let restart = spawn_qxd(&config_paths[victim_idx]).await;
+    let restart = spawn_qx(&config_paths[victim_idx]).await;
     children.insert(victim_idx, restart);
     wait_until_port_open(client_ports[victim_idx], Duration::from_secs(15)).await;
 
@@ -286,7 +286,7 @@ async fn reserve_ports(n: usize) -> (Vec<u16>, Vec<u16>) {
     (a, b)
 }
 
-async fn spawn_qxd(config_path: &std::path::Path) -> tokio::process::Child {
+async fn spawn_qx(config_path: &std::path::Path) -> tokio::process::Child {
     tokio::process::Command::new(env!("CARGO_BIN_EXE_qx"))
         .arg("--config")
         .arg(config_path)
@@ -294,7 +294,7 @@ async fn spawn_qxd(config_path: &std::path::Path) -> tokio::process::Child {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn qxd")
+        .expect("spawn qx")
 }
 
 async fn write_file(path: &std::path::Path, contents: &[u8]) {
@@ -313,7 +313,7 @@ async fn wait_until_port_open(port: u16, timeout: Duration) {
             return;
         }
         if Instant::now() >= deadline {
-            panic!("qxd never bound to port {port} within {timeout:?}");
+            panic!("qx never bound to port {port} within {timeout:?}");
         }
         sleep(Duration::from_millis(50)).await;
     }
